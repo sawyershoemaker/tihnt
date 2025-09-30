@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "TIHNT",
+  "version": "0.0",
+  "description": "Tile Information & Hidden Node Toolkit",
+  "permissions": ["storage", "scripting", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "toggle-logging": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+L"
+      },
+      "description": "Toggle debug logging"
+    }
+  }
+}
+
+
