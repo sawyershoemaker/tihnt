@@ -11,7 +11,7 @@ TIHNT or the Tile Information & Hidden Node Toolkit (holy backronym) is a day-ma
 - on screen overlay (STREAMPROOOF, literally invisible on obs/discord/whatever respects the flag)
 - discrete keyboard shortcuts for toggles
 - advanced chording (toggleable), and a safe mode (prevents you from clicking mines)
-- optimized asf! minimal cpu overhead compares to calculations and such an advanced solver
+- optimized asf! minimal cpu overhead compared to calculations and such an advanced solver
 
 ## keybinds
 - **Shift + M** — Enter mine amount (helps with guesses)
