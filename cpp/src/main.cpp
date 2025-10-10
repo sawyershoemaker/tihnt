@@ -39,12 +39,10 @@ int main(){
     const int kHotkeyToggleChords = 2;
     const int kHotkeyToggleCapture = 3;
     const int kHotkeyToggleSafety = 4;
-    const int kHotkeyClickNearest = 5;
     RegisterHotKey(nullptr, kHotkeyExit, MOD_CONTROL | MOD_ALT | 0x4000, 'X');
     RegisterHotKey(nullptr, kHotkeyToggleChords, MOD_CONTROL | 0x4000, 'P');
     RegisterHotKey(nullptr, kHotkeyToggleCapture, MOD_CONTROL | 0x4000, 'W');
     RegisterHotKey(nullptr, kHotkeyToggleSafety, MOD_CONTROL | MOD_ALT | 0x4000, 'S');
-    RegisterHotKey(nullptr, kHotkeyClickNearest, MOD_CONTROL | 0x4000, 'Q');
 #endif
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
@@ -76,6 +74,9 @@ int main(){
                 geom.vv_x = parsed.delta.vv_x; geom.vv_y = parsed.delta.vv_y; geom.vv_scale = (parsed.delta.vv_scale>0?parsed.delta.vv_scale:geom.vv_scale);
                 geom.dpr = (parsed.delta.dpr>0?parsed.delta.dpr:geom.dpr);
             }
+        } else if(parsed.type==proto::MsgType::Bind){
+            int pid = parsed.bind.pid;
+            if(pid > 0){ overlay.set_target_pid((uint32_t)pid); }
         }
         dirty = true;
     });
@@ -93,7 +94,6 @@ int main(){
                 if((int)msg.wParam == kHotkeyToggleChords){ g_enable_chords.store(!g_enable_chords.load()); dirty = true; continue; }
                 if((int)msg.wParam == kHotkeyToggleCapture){ overlay.set_excluded_from_capture(!overlay.is_excluded_from_capture()); continue; }
                 if((int)msg.wParam == kHotkeyToggleSafety){ overlay.set_safety_mode(!overlay.is_safety_mode()); continue; }
-                if((int)msg.wParam == kHotkeyClickNearest){ overlay.click_nearest_safe_guess(); continue; }
             }
             TranslateMessage(&msg); DispatchMessage(&msg);
         }
@@ -131,7 +131,6 @@ int main(){
     UnregisterHotKey(nullptr, kHotkeyExit);
     UnregisterHotKey(nullptr, kHotkeyToggleChords);
     UnregisterHotKey(nullptr, kHotkeyToggleCapture);
-    UnregisterHotKey(nullptr, kHotkeyClickNearest);
 #endif
     server.stop();
     overlay.destroy();

@@ -2,6 +2,8 @@
 
 #include <vector>
 #include <cstdint>
+#include <atomic>
+#include <thread>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -45,6 +47,7 @@ public:
 
 #ifdef _WIN32
     bool click_nearest_safe_guess();
+    void set_target_pid(uint32_t pid);
 #endif
 
 private:
@@ -56,6 +59,10 @@ private:
     HWND findRenderHost();
     void hide();
     void show_noactivate();
+    bool human_move_to(int targetScreenX, int targetScreenY);
+    enum class ClickType : uint8_t { Left, Right, ChordBoth };
+    bool host_click_at_screen(int screenX, int screenY, ClickType type);
+    bool refresh_exclusion_state();
 
     HWND hwnd_ = nullptr;
     HBITMAP dib_ = nullptr;
@@ -68,9 +75,16 @@ private:
     std::vector<solve::Mark> marks_;
     OverlayGeometry geom_{};
     int mines_total_ = 0;
-    bool excluded_from_capture_ = true;
+    bool excluded_from_capture_ = false;
     bool visible_ = true;
     bool safety_mode_ = false;
+#ifdef _WIN32
+#  if defined(_WIN32)
+    unsigned long target_pid_ = 0;
+#  else
+    unsigned long target_pid_ = 0;
+#  endif
+#endif
 };
 
 

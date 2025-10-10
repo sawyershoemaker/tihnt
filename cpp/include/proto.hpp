@@ -39,12 +39,17 @@ struct DeltaMsg {
     double dpr=1.0;
 };
 
-enum class MsgType { Full, Delta, Unknown };
+struct BindMsg {
+    int pid = 0;
+};
+
+enum class MsgType { Full, Delta, Bind, Unknown };
 
 struct ParsedMessage {
     MsgType type = MsgType::Unknown;
     FullMsg full;
     DeltaMsg delta;
+    BindMsg bind;
 };
 
 bool parse_message(const std::string& json, ParsedMessage& out);

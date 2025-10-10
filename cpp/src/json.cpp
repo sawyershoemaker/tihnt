@@ -28,7 +28,7 @@ static bool parse_array_end(const std::string& s, size_t& i){ return match(s,i,'
 static bool parse_colon(const std::string& s, size_t& i){ return match(s,i,':'); }
 static bool parse_comma(const std::string& s, size_t& i){ return match(s,i,','); }
 
-using proto::FullMsg; using proto::DeltaMsg; using proto::ParsedMessage; using proto::MsgType;
+using proto::FullMsg; using proto::DeltaMsg; using proto::ParsedMessage; using proto::MsgType; using proto::BindMsg;
 
 static bool parse_cells_array(const std::string& s, size_t& i, std::vector<game::CellState>& out){
     if(!parse_array_start(s,i)) return false; out.clear();
@@ -56,12 +56,23 @@ static bool parse_delta(const std::string& s, size_t& i, DeltaMsg& out){
     return gotu;
 }
 
+static bool parse_bind(const std::string& s, size_t& i, BindMsg& out){
+    if(!parse_object_start(s,i)) return false; bool gotp=false;
+    for(;;){ std::string key; if(!parse_string(s,i,key)) return false; if(!parse_colon(s,i)) return false; if(key=="pid"){ if(!parse_int(s,i,out.pid)) return false; gotp=true; }
+        else { int dummy; if(!parse_int(s,i,dummy)) { std::string tmp; if(!parse_string(s,i,tmp)) { double d; if(!parse_double(s,i,d)) return false; } } }
+        size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_object_end(s,i)) break; else return false; }
+    return gotp;
+}
+
 static bool parse_root(const std::string& s, ParsedMessage& out){
     if(s.find("\"type\":\"full\"") != std::string::npos){
         size_t r=0; bool ok = parse_full(s,r,out.full); if(ok){ out.type=MsgType::Full; } return ok;
     }
     if(s.find("\"type\":\"delta\"") != std::string::npos){
         size_t r=0; bool ok = parse_delta(s,r,out.delta); if(ok){ out.type=MsgType::Delta; } return ok;
+    }
+    if(s.find("\"type\":\"bind\"") != std::string::npos){
+        size_t r=0; bool ok = parse_bind(s,r,out.bind); if(ok){ out.type=MsgType::Bind; } return ok;
     }
     size_t i=0; if(!parse_object_start(s,i)) return false; std::string type; bool gott=false;
     size_t j=i; for(;;){ std::string key; if(!parse_string(s,j,key)) return false; if(!parse_colon(s,j)) return false; if(key=="type"){ if(!parse_string(s,j,type)) return false; gott=true; } else {
@@ -71,6 +82,7 @@ static bool parse_root(const std::string& s, ParsedMessage& out){
     if(!gott) return false;
     size_t r=0; if(type=="full"){ bool ok = parse_full(s,r,out.full); if(ok){ out.type=MsgType::Full; } return ok; }
     if(type=="delta"){ bool ok = parse_delta(s,r,out.delta); if(ok){ out.type=MsgType::Delta; } return ok; }
+    if(type=="bind"){ bool ok = parse_bind(s,r,out.bind); if(ok){ out.type=MsgType::Bind; } return ok; }
     return false;
 }
 

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <iostream>
+#include <climits>
 
 #ifdef _WIN32
 #include <dwmapi.h>
@@ -29,8 +30,13 @@ bool OverlayWindow::create(){
     }
     // streamproof the overlay from most capture APIs when supported
 #if defined(WDA_EXCLUDEFROMCAPTURE)
-    SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
-    excluded_from_capture_ = true;
+    excluded_from_capture_ = false;
+    BOOL okAffinity = SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
+    if(!okAffinity){
+        std::cerr << "OverlayWindow::create: SetWindowDisplayAffinity failed, err=" << GetLastError() << std::endl;
+    }
+    // reflect actual state using GetWindowDisplayAffinity when available
+    refresh_exclusion_state();
 #endif
 #ifdef DWMWA_EXCLUDED_FROM_PEEK
     // also exclude from aero peek/thumbnail where available
@@ -82,7 +88,7 @@ LRESULT CALLBACK OverlayWindow::WndProcThunk(HWND hwnd, UINT msg, WPARAM wp, LPA
 }
 
 HWND OverlayWindow::findRenderHost(){
-    // anchoring (needs some work)
+    // anchoring (should be fixed if u ctrl+q bind)
     static HWND lastTop = nullptr;
     static HWND lastHost = nullptr;
 
@@ -106,9 +112,28 @@ HWND OverlayWindow::findRenderHost(){
     HWND host = findChildByClass(fg, L"Chrome_RenderWidgetHostHWND");
     if(!host) host = fg;
 
+    // if target PID set, attempt to locate a window with that PID
+    if(target_pid_ != 0){
+        DWORD pid=0; GetWindowThreadProcessId(host, &pid);
+        if(pid != target_pid_){
+            HWND best = nullptr;
+            for(HWND w = GetTopWindow(nullptr); w; w = GetNextWindow(w, GW_HWNDNEXT)){
+                DWORD p=0; GetWindowThreadProcessId(w, &p);
+                if(p == target_pid_){ best = w; break; }
+            }
+            if(best){
+                HWND h2 = findChildByClass(best, L"Chrome_RenderWidgetHostHWND");
+                host = h2 ? h2 : best;
+            }
+        }
+    }
+
     lastTop = fg;
     lastHost = host;
     return host;
+}
+void OverlayWindow::set_target_pid(uint32_t pid){
+    target_pid_ = pid;
 }
 
 bool OverlayWindow::ensureSurface(int w, int h){
@@ -259,7 +284,7 @@ void OverlayWindow::redraw(){
                 0x1F,
                 0x10,
                 0x1E,
-                0x10,   # F
+                0x10,
                 0x10,
                 0x10,
                 0x10
@@ -305,7 +330,7 @@ void OverlayWindow::redraw(){
                 if(m==solve::Mark::None) continue; // only overlay the specified categories
                 int cx0 = x0[xx];
                 int cx1 = x0[xx+1] - 1;
-                if(cx1<cx0) cx1=cx0; if(cy1<cy0) ; // cy1>=cy0 by construction
+                if(cx1<cx0) cx1=cx0;
                 if(m==solve::Mark::Safe){
                     drawRectStroke(cx0, cy0, cx1, cy1, 0xAA00FF00); // A,R,G,B packed as ARGB
                 } else if(m==solve::Mark::Mine){
@@ -483,8 +508,12 @@ void OverlayWindow::set_excluded_from_capture(bool exclude){
 #ifdef _WIN32
 #if defined(WDA_EXCLUDEFROMCAPTURE)
     if(hwnd_){
-        SetWindowDisplayAffinity(hwnd_, exclude ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
-        excluded_from_capture_ = exclude;
+        BOOL ok = SetWindowDisplayAffinity(hwnd_, exclude ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+        if(!ok){
+            std::cerr << "OverlayWindow::set_excluded_from_capture: SetWindowDisplayAffinity failed, err=" << GetLastError() << std::endl;
+        }
+        // reflect actual state by querying current affinity when possible
+        refresh_exclusion_state();
     }
 #else
     (void)exclude;
@@ -532,98 +561,20 @@ bool OverlayWindow::is_safety_mode() const{
 
 
 #ifdef _WIN32
-bool OverlayWindow::click_nearest_safe_guess(){
-    if(!hwnd_) return false;
-    if(marks_.empty() || geom_.board_w<=0 || geom_.board_h<=0) return false;
-    // get current overlay surface rect in screen space
-    RECT rc; if(!GetWindowRect(hwnd_, &rc)) return false;
-    int dstW = rc.right - rc.left;
-    int dstH = rc.bottom - rc.top;
-    if(dstW<=0 || dstH<=0) return false;
-
-    // build per-cell pixel edges in overlay client coordinates [0..dstW/H)
-    const int w = geom_.board_w;
-    const int h = geom_.board_h;
-    std::vector<int> xEdge(w+1), yEdge(h+1);
-    for(int xx=0; xx<=w; ++xx){ xEdge[xx] = (int)std::round(((double)dstW * (double)xx) / (double)w); }
-    for(int yy=0; yy<=h; ++yy){ yEdge[yy] = (int)std::round(((double)dstH * (double)yy) / (double)h); }
-
-    // get current cursor pos in screen, convert to overlay client
-    POINT cursor; if(!GetCursorPos(&cursor)) return false;
-    POINT clientPt{ cursor.x - rc.left, cursor.y - rc.top };
-
-    // determine the cell index under the cursor, if any
-    auto locateCell = [&](int px, int py, int& cx, int& cy){
-        cx = -1; cy = -1;
-        for(int xx=0; xx<w; ++xx){ if(px >= xEdge[xx] && px <= xEdge[xx+1]-1){ cx = xx; break; } }
-        for(int yy=0; yy<h; ++yy){ if(py >= yEdge[yy] && py <= yEdge[yy+1]-1){ cy = yy; break; } }
-    };
-    int curCellX=-1, curCellY=-1; locateCell(clientPt.x, clientPt.y, curCellX, curCellY);
-
-    auto isSafeGuess = [&](int ix, int iy){
-        if(ix<0||iy<0||ix>=w||iy>=h) return false;
-        size_t idx = (size_t)iy * (size_t)w + (size_t)ix;
-        if(idx >= marks_.size()) return false;
-        auto m = marks_[idx];
-        return (m==solve::Mark::Safe || m==solve::Mark::Guess);
-    };
-
-    // find nearest Safe/Guess cell center to cursor within overlay bounds
-    int bestX=-1, bestY=-1; int bestCellX=-1, bestCellY=-1; long long bestD2 = LLONG_MAX;
-    const int cx = clientPt.x; const int cy = clientPt.y;
-    for(int yy=0; yy<h; ++yy){
-        int cy0 = yEdge[yy]; int cy1 = yEdge[yy+1]-1; if(cy1<cy0) cy1=cy0;
-        for(int xx=0; xx<w; ++xx){
-            if(!isSafeGuess(xx,yy)) continue;
-            int cx0 = xEdge[xx]; int cx1 = xEdge[xx+1]-1; if(cx1<cx0) cx1=cx0;
-            int mx = cx0 + (cx1 - cx0)/2;
-            int my = cy0 + (cy1 - cy0)/2;
-            long long dx = (long long)mx - (long long)cx;
-            long long dy = (long long)my - (long long)cy;
-            long long d2 = dx*dx + dy*dy;
-            if(d2 < bestD2){ bestD2 = d2; bestX = mx; bestY = my; bestCellX = xx; bestCellY = yy; }
-        }
+bool OverlayWindow::refresh_exclusion_state(){
+#if defined(WDA_EXCLUDEFROMCAPTURE)
+    if(!hwnd_) { excluded_from_capture_ = false; return false; }
+    DWORD affinity = 0;
+    BOOL ok = GetWindowDisplayAffinity(hwnd_, &affinity);
+    if(!ok){
+        std::cerr << "OverlayWindow::refresh_exclusion_state: GetWindowDisplayAffinity failed, err=" << GetLastError() << std::endl;
+        return false;
     }
-    if(bestX<0 || bestY<0) return false;
-
-    // if the distance exceeds x tiles, add a small delay before clicking
-    bool needsDelay = false;
-    if(curCellX>=0 && curCellY>=0 && bestCellX>=0 && bestCellY>=0){
-        int dxTiles = bestCellX - curCellX;
-        int dyTiles = bestCellY - curCellY;
-        double tileDist = std::sqrt((double)(dxTiles*dxTiles + dyTiles*dyTiles));
-        if(tileDist > 5.5) needsDelay = true;
-    } else {
-        // estimate using average cell size when not directly over a cell
-        double avgW = (double)dstW / (double)w;
-        double avgH = (double)dstH / (double)h;
-        double dxT = ((double)bestX - (double)cx) / (avgW>0?avgW:1.0);
-        double dyT = ((double)bestY - (double)cy) / (avgH>0?avgH:1.0);
-        double tileDist = std::sqrt(dxT*dxT + dyT*dyT);
-        if(tileDist > 5.5) needsDelay = true;
-    }
-
-    // convert overlay client to screen
-    POINT clickPt{ bestX + rc.left, bestY + rc.top };
-
-    // send click to underlying render host (Chrome) at screen coordinates
-    HWND host = findRenderHost(); if(!host) host = GetForegroundWindow();
-    if(!host) return false;
-
-    // windows expects lParam for mouse messages as client coords; map screen to client
-    POINT hostClient = clickPt; ScreenToClient(host, &hostClient);
-    LPARAM lparam = (LPARAM)((hostClient.y << 16) | (hostClient.x & 0xFFFF));
-    WPARAM wparam = 0; // no MK_xxx since we synthesize down/up separately
-
-    // move cursor to the point for visual feedback
-    SetCursorPos(clickPt.x, clickPt.y);
-
-    if(needsDelay){ Sleep(730); }
-
-    // press and release left button
-    PostMessage(host, WM_LBUTTONDOWN, MK_LBUTTON, lparam);
-    PostMessage(host, WM_LBUTTONUP, 0, lparam);
+    excluded_from_capture_ = (affinity == WDA_EXCLUDEFROMCAPTURE);
     return true;
+#else
+    excluded_from_capture_ = false;
+    return false;
+#endif
 }
 #endif
-

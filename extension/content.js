@@ -148,18 +148,20 @@
       if (!c) continue;
       const idx = c.y * w + c.x;
       const classes = (el.className || '').split(/\s+/);
-      let opened = false, closed = false, tnum = null;
+      let opened = false, closed = false, tnum = null, hasFlag = false;
       for (const cl of classes) {
         if (/^[a-z]+_opened$/.test(cl)) opened = true;
         else if (/^[a-z]+_closed$/.test(cl)) closed = true;
         const v = normType(cl); if (v !== null) tnum = v;
+        if (/_flag$/.test(cl)) hasFlag = true;
       }
       if (opened) {
         if (tnum === 10) { bombDetected = true; }
         else if (tnum !== null && tnum >= 0 && tnum <= 8) { states[idx] = 10 + tnum; }
         else { states[idx] = 10; } // opened zero as fallback
       } else if (closed) {
-        states[idx] = 0;
+        // represent flagged cells as state=2 (game::CellState::Mine) so backend knows flags already exist
+        states[idx] = hasFlag ? 2 : 0;
       }
     }
     const snap = { w, h, states, origin, cellPx, bombDetected, rect, vv: { x: vv_x, y: vv_y, scale: vv_scale } };

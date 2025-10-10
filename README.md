@@ -19,7 +19,7 @@ TIHNT or the Tile Information & Hidden Node Toolkit (holy backronym) is a day-ma
 - **Ctrl + P** — Toggle chording
 - **Ctrl + W**— Toggle stream-proof mode
 - **Ctrl + Alt + S** — Toggle safety
-- **Ctrl + Q**— Click nearest safe/guess square
+- **Ctrl + Q**— Bind overlay to PID of browser
 
 ## privacy
 - websocket is lightweight and only runs locally, mostly for speed but you also don't need to worry about me having ur game data

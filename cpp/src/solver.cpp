@@ -162,16 +162,16 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
 				}
 				int missing = num - flagged;
 				if(missing < 0 || missing > unknownCount) continue;
-				if(missing == 0){
+                if(missing == 0){
                     int safeClicks = unknownCount;
-					if(safeClicks > 1){
-						if(ov.marks[idx] == Mark::None){ ov.marks[idx] = Mark::Chord; }
-					}
-				} else {
+                    if(safeClicks > 1){
+                        if(ov.marks[idx] == Mark::None){ ov.marks[idx] = Mark::Chord; }
+                    }
+                } else {
 					if(neededCnt == missing){
-						int chordCost = missing + 1;
-						int safeClicks = unknownCount - missing;
-						if(chordCost <= safeClicks){
+                        int chordCost = missing + 1;
+                        int safeClicks = unknownCount - missing;
+                        if(chordCost < safeClicks){
 							if(ov.marks[idx] == Mark::None){ ov.marks[idx] = Mark::Chord; }
 							for(int t=0; t<neededCnt; ++t){ int nb = neededMineIdx[t]; if(cells[nb] != CellState::Mine){ ov.marks[nb] = Mark::FlagForChord; } }
 						}
@@ -434,6 +434,91 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                     else if(std::abs(ov.mineProbability[i] - bestProb) <= eps){ ov.marks[i]=Mark::Guess; }
                 }
             }
+
+    // chord valuation using probabilities and a simple cascade heuristic
+    if(enableChords && ov.mineProbability.size()==(size_t)N){
+        // clear prior chord/flag marks while preserving Safe/Mine/Guess
+        for(int i=0;i<N;++i){ if(ov.marks[i]==Mark::Chord || ov.marks[i]==Mark::FlagForChord) ov.marks[i]=Mark::None; }
+
+        auto probOf = [&](int idx)->double{
+            double p = 1.0; // default to risky if unknown
+            if(idx>=0 && idx<N && cells[idx]==CellState::Unknown){
+                p = ov.mineProbability[idx];
+                if(!(p>=0.0 && p<=1.0)) p = 1.0; // clamp invalids to risky
+            } else if(idx>=0 && idx<N && (cells[idx]==CellState::Mine || ov.marks[idx]==Mark::Mine)){
+                p = 1.0;
+            } else {
+                p = 0.0;
+            }
+            if(p<0.0) p=0.0; if(p>1.0) p=1.0;
+            return p;
+        };
+
+        auto willFlagForChord = [&](int idx)->bool{ return ov.marks[idx]==Mark::Mine && cells[idx]!=CellState::Mine; };
+
+        const double kCascadeDampen = 0.5; // dampen cascade bonus to avoid double counting
+        for(int y=0; y<h; ++y){
+            for(int x=0; x<w; ++x){
+                int idx = to_index(x,y,w);
+                int num = cell_number(cells[idx]); if(num<0) continue;
+
+                // gather neighbor status
+                int flagged=0; std::vector<int> unknowns; unknowns.reserve(8);
+                std::vector<int> needFlags; needFlags.reserve(8);
+                for(int k=0;k<neighborCounts[idx];++k){
+                    int nb = neighbors[idx][k];
+                    CellState s = cells[nb];
+                    if(s==CellState::Mine){ flagged++; continue; }
+                    if(s==CellState::Unknown){
+                        unknowns.push_back(nb);
+                        if(ov.marks[nb]==Mark::Mine){ needFlags.push_back(nb); }
+                    }
+                }
+                int missing = num - flagged;
+                if(missing < 0 || missing > (int)unknowns.size()) continue;
+
+                // candidate only if either all mines accounted and at least 2 safe openings, or we can place exactly the missing flags among deduced mines
+                int clicks = 0;
+                std::vector<int> flagList;
+                if(missing==0){
+                    clicks = 1; // just the chord click
+                } else {
+                    if((int)needFlags.size()!=missing) continue; // cannot chord safely unless deduced flags cover missing
+                    clicks = missing + 1; // place flags + chord
+                    flagList = needFlags;
+                }
+
+                // compute expected reveal from chord
+                double expectedReveals = 0.0; double cascadeBonus = 0.0;
+                for(int u : unknowns){
+                    // skip cells that will be flagged for chord
+                    bool isPlannedFlag = false; for(int f : flagList){ if(f==u){ isPlannedFlag=true; break; } }
+                    if(isPlannedFlag) continue;
+                    double pu = probOf(u);
+                    expectedReveals += (1.0 - pu);
+                    int uc2=0; int list2[8];
+                    for(int kk=0; kk<neighborCounts[u]; ++kk){ int m = neighbors[u][kk]; if(m==idx) continue; if(cells[m]==CellState::Unknown){ // consider fresh unknowns
+                            // avoid counting flags planned for this chord
+                            bool pf=false; for(int f : flagList){ if(f==m){ pf=true; break; } }
+                            if(pf) continue;
+                            list2[uc2++] = m; }
+                    }
+                    if(uc2>0){
+                        long double zeroProb = 1.0L; for(int t=0;t<uc2;++t){ double pm = probOf(list2[t]); zeroProb *= (long double)(1.0 - pm); }
+                        // expected extra reveals if zero opens: number of neighbors (conservative damped)
+                        cascadeBonus += (double)zeroProb * (double)uc2 * kCascadeDampen * (1.0 - pu);
+                    }
+                }
+
+                double totalValue = expectedReveals + cascadeBonus;
+                // require strictly higher value than clicks
+                if(totalValue > (double)clicks + 1e-6){
+                    if(ov.marks[idx]==Mark::None){ ov.marks[idx]=Mark::Chord; }
+                    for(int f : flagList){ if(cells[f] != CellState::Mine){ ov.marks[f]=Mark::FlagForChord; } }
+                }
+            }
+        }
+    }
         } else {
             int cx=w/2, cy=h/2; int bestIdx=-1; int bestDist=std::numeric_limits<int>::max();
             for(int y=0;y<h;++y){ for(int x=0;x<w;++x){ if(board.at(x,y)==CellState::Unknown){ int dx=x-cx, dy=y-cy; int d=dx*dx+dy*dy; if(d<bestDist){ bestDist=d; bestIdx=to_index(x,y,w);} } } }

@@ -3,7 +3,7 @@
   "name": "TIHNT",
   "version": "0.0",
   "description": "Tile Information & Hidden Node Toolkit",
-  "permissions": ["storage", "scripting", "activeTab"],
+  "permissions": ["storage", "scripting", "activeTab", "processes"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
@@ -21,6 +21,12 @@
         "default": "Ctrl+Shift+L"
       },
       "description": "Toggle debug logging"
+    },
+    "bind-overlay-to-tab": {
+      "suggested_key": {
+        "default": "Ctrl+Q"
+      },
+      "description": "Send current tab's PID to overlay"
     }
   }
 }

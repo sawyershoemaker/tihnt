@@ -58,6 +58,28 @@ chrome.commands.onCommand.addListener((cmd) => {
       console.log('[mines-ext/bg]', 'toggled debug to', next);
     });
   }
+  if (cmd === 'bind-overlay-to-tab') {
+    try {
+      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const tab = tabs && tabs[0];
+        if (!tab) { log('no active tab for bind'); return; }
+        // Obtain PID via chrome.processes API
+        try {
+          const procs = await chrome.processes.getProcessIdForTab(tab.id);
+          const pid = Number(procs);
+          if (!Number.isFinite(pid) || pid <= 0) { log('bind: invalid pid', procs); return; }
+          if (!connected || !socket || socket.readyState !== WebSocket.OPEN) { log('bind: ws not open'); return; }
+          const payload = JSON.stringify({ type: 'bind', pid });
+          log('bind send', payload);
+          socket.send(payload);
+        } catch (e) {
+          log('bind error', String(e));
+        }
+      });
+    } catch (e) {
+      log('bind cmd error', String(e));
+    }
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
