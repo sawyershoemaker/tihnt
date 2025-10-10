@@ -278,6 +278,14 @@ void OverlayWindow::redraw(){
                 for(int y=yt0; y<=yt1; ++y){ putPixelV(xt0, y, colv); putPixelV(xt1, y, colv); }
             }
         };
+        auto fillRect = [&](int x0, int y0, int x1, int y1, uint32_t color){
+            uint32_t colv = toPremulBGRA(color);
+            if(x1<x0) x1=x0; if(y1<y0) y1=y0;
+            for(int y=y0; y<=y1; ++y){
+                uint8_t* row = bits_ + y*stride_ + x0*4;
+                for(int x=x0; x<=x1; ++x){ *reinterpret_cast<uint32_t*>(row) = colv; row += 4; }
+            }
+        };
         auto drawGlyphFScaled = [&](int cellX0, int cellY0, int cellX1, int cellY1, uint32_t color){
             uint32_t colv = toPremulBGRA(color);
             static const unsigned char glyphF[7] = {
@@ -342,8 +350,9 @@ void OverlayWindow::redraw(){
                     // blue 'F' on the numbered cell to click for chord (fully opaque)
                     drawGlyphFScaled(cx0, cy0, cx1, cy1, 0xFF1E90FF);
                 } else if(m==solve::Mark::FlagForChord){
-                    // blue square on mines that need flagging for the shown chord
-                    drawRectStroke(cx0, cy0, cx1, cy1, 0xAA1E90FF);
+                    // blue filled square on mines that need flagging for the shown chord
+                    fillRect(cx0, cy0, cx1, cy1, 0x661E90FF);
+                    drawRectStroke(cx0, cy0, cx1, cy1, 0xFF1E90FF);
                 }
             }
         }
