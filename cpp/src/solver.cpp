@@ -136,10 +136,30 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                         for(int i=0;i<ucount;++i){ int q=unknownIdx[i]; if(!isIn(q, u2, u2c)){ if(ov.marks[q]!=Mark::Mine){ ov.marks[q]=Mark::Mine; any=true; enqueueNbrNumbers(q);} }
                         }
                     }
+                } else {
+                    // general difference rule for overlapping sets (neither subset of the other)
+                    int only1 = ucount - common;
+                    int only2 = u2c - common;
+                    if(only1 > 0 && (rem1 - rem2) == only1){
+                        for(int i=0;i<ucount;++i){
+                            int q = unknownIdx[i];
+                            if(!isIn(q, u2, u2c)){
+                                if(ov.marks[q] != Mark::Mine){ ov.marks[q] = Mark::Mine; any=true; enqueueNbrNumbers(q); }
+                            }
+                        }
+                    }
+                    if(only2 > 0 && (rem2 - rem1) == only2){
+                        for(int i=0;i<u2c;++i){
+                            int q = u2[i];
+                            if(!isIn(q, unknownIdx, ucount)){
+                                if(ov.marks[q] != Mark::Mine){ ov.marks[q] = Mark::Mine; any=true; enqueueNbrNumbers(q); }
+                            }
+                        }
+                    }
                 }
             }
         }
-        (void)any; // already enqueued impacted numbers when we changed marks
+        (void)any;
 	}
 
 	if(enableChords){
@@ -184,8 +204,6 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
 	// determine if we have any guaranteed safe so far
 	for(const auto m : ov.marks){ if(m == Mark::Safe){ ov.hasGuaranteedSafe = true; break; } }
 
-	// Build frontier components and compute probabilities using exact enumeration where feasible,
-	// then fall back to BP. Use results to mark certain Safe/Mine and best Guess if needed.
         std::vector<uint8_t> isFrontier(N,0);
         for(int i=0;i<N;++i){ if(board.data()[i]==CellState::Unknown){ for(int k=0;k<neighborCounts[i];++k){ int nb=neighbors[i][k]; if(cell_number(board.data()[nb])>=0){ isFrontier[i]=1; break; } } } }
 
@@ -227,7 +245,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             comps[cid].cons.push_back(std::move(con));
         } }
 
-        const int ENUM_CAP = 22;
+        const int ENUM_CAP = 26;
         for(int cid=0; cid<compCount; ++cid){
             auto& C = comps[cid];
             C.m = (int)C.U.size();
@@ -236,6 +254,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             C.waysK.assign(C.m+1, 0.0L);
             C.mineWaysPerCellK.assign(C.m, std::vector<long double>(C.m+1, 0.0L));
             std::vector<uint8_t> assign(C.m, 255);
+            // order variables by descending degree (number of constraints touching them) to reduce branching
+            std::vector<int> degree(C.m, 0);
+            for(const auto& con : C.cons){ for(int ui : con.uidx){ if(ui>=0 && ui<C.m) degree[ui]++; } }
+            std::vector<int> order(C.m); for(int i=0;i<C.m;++i) order[i]=i;
+            std::sort(order.begin(), order.end(), [&](int a, int b){ if(degree[a]!=degree[b]) return degree[a]>degree[b]; return a<b; });
             std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
                 // local feasibility against all constraints
                 for(const auto& con : C.cons){
@@ -250,14 +273,20 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                     for(int t=0;t<C.m;++t){ if(assign[t]==1) C.mineWaysPerCellK[t][minesSoFar] += 1.0L; }
                     return;
                 }
-                assign[idx]=0; dfs(idx+1, minesSoFar);
-                assign[idx]=1; dfs(idx+1, minesSoFar+1);
-                assign[idx]=255;
+                int var = order[idx];
+                assign[var]=0; dfs(idx+1, minesSoFar);
+                assign[var]=1; dfs(idx+1, minesSoFar+1);
+                assign[var]=255;
             };
             dfs(0,0);
             C.enumerated = (C.totalSolutions > 0.0L);
             if(C.enumerated && totalMines==0){
-                for(int t=0;t<C.m;++t){ long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += C.mineWaysPerCellK[t][k]; ov.mineProbability[C.U[t]] = (double)(mw / C.totalSolutions); }
+                for(int t=0;t<C.m;++t){
+                    long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += C.mineWaysPerCellK[t][k];
+                    if(mw <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; }
+                    else if(std::fabsl(mw - C.totalSolutions) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; }
+                    else { ov.mineProbability[C.U[t]] = (double)(mw / C.totalSolutions); }
+                }
             }
         }
 
@@ -267,7 +296,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         for(int cid=0; cid<compCount; ++cid){
             auto& C = comps[cid];
             if(C.m==0 || (int)C.cons.size()==0) continue;
-            if(C.enumerated) continue; // already handled exactly
+            if(C.enumerated) continue;
 
             // build variable-to-constraint adjacency
             struct EdgeRef { int conIndex; int posInCon; };
@@ -368,7 +397,20 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             if(totalWeight>0.0L){
                 for(int ii=0; ii<E; ++ii){ int cid = enumIdx[ii]; auto& C = comps[cid];
                     std::vector<long double> other(prefix[ii].size()+suffix[ii+1].size()-1, 0.0L); for(size_t a=0;a<prefix[ii].size();++a){ for(size_t b=0;b<suffix[ii+1].size();++b){ other[a+b] += prefix[ii][a]*suffix[ii+1][b]; } }
-                    for(int t=0;t<C.m;++t){ long double numer=0.0L; for(int k=0;k<=C.m;++k){ if(C.mineWaysPerCellK[t][k]==0.0L) continue; for(size_t rOther=0;rOther<other.size();++rOther){ int needOut = remainingGlobal - ((int)rOther + k); if(needOut<0 || needOut>freeUnknown) continue; numer += C.mineWaysPerCellK[t][k] * other[rOther] * combFree[needOut]; } } ov.mineProbability[C.U[t]] = (double)(numer / totalWeight); }
+                    for(int t=0;t<C.m;++t){
+                        long double numer=0.0L;
+                        for(int k=0;k<=C.m;++k){
+                            if(C.mineWaysPerCellK[t][k]==0.0L) continue;
+                            for(size_t rOther=0;rOther<other.size();++rOther){
+                                int needOut = remainingGlobal - ((int)rOther + k);
+                                if(needOut<0 || needOut>freeUnknown) continue;
+                                numer += C.mineWaysPerCellK[t][k] * other[rOther] * combFree[needOut];
+                            }
+                        }
+                        if(numer <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; }
+                        else if(std::fabsl(numer - totalWeight) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; }
+                        else { ov.mineProbability[C.U[t]] = (double)(numer / totalWeight); }
+                    }
                 }
             }
         }
@@ -422,20 +464,24 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             }
         }
 
+        // clamp near-certain probabilities exactly to 0/1 to harden certainty detection
+        if(ov.mineProbability.size()==(size_t)N){
+            for(int i=0;i<N;++i){ if(ov.mineProbability[i] >= 0.0){ if(ov.mineProbability[i] <= 1e-12) ov.mineProbability[i]=0.0; else if(ov.mineProbability[i] >= 1.0 - 1e-12) ov.mineProbability[i]=1.0; } }
+        }
         bool hasProb=false; double bestProb=std::numeric_limits<double>::infinity();
         if(ov.mineProbability.size()==(size_t)N){
             for(int i=0;i<N;++i){ if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){ hasProb=true; if(ov.mineProbability[i] < bestProb) bestProb = ov.mineProbability[i]; } }
         }
         std::vector<int> changedByProb; changedByProb.reserve(N/8+1);
         if(hasProb && std::isfinite(bestProb)){
-            const double eps=1e-9;
+            const double eps=1e-6;
             for(int i=0;i<N;++i){
                 if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){
                     if(ov.mineProbability[i] <= eps){ if(ov.marks[i]!=Mark::Safe){ ov.marks[i]=Mark::Safe; ov.hasGuaranteedSafe = true; changedByProb.push_back(i); } }
                     else if(ov.mineProbability[i] >= 1.0 - eps){ if(ov.marks[i]!=Mark::Mine){ ov.marks[i]=Mark::Mine; changedByProb.push_back(i); } }
                 }
             }
-            // Only set Guess when no guaranteed safe exists
+            // only set Guess when no guaranteed safe exists
             if(!ov.hasGuaranteedSafe){
                 for(int i=0;i<N;++i){
                     if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){
@@ -493,19 +539,31 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             return { expectedReveals, cascadeBonus };
         };
 
-        auto computeBestSingle = [&](const std::vector<int>& unknowns, const std::vector<int>& plannedFlags, int centerA, int centerB, double dampen)->double{
-            double bestSingle = 0.0;
+        auto computeSingleValue = [&](int u, const std::vector<int>& plannedFlags, int centerA, int centerB, double dampen)->double{
+            double pu = probOf(u);
+            double singleVal = (1.0 - pu);
+            int uc2=0; int list2[8];
+            for(int kk=0; kk<neighborCounts[u]; ++kk){ int m = neighbors[u][kk]; if(m==centerA || m==centerB) continue; if(cells[m]==CellState::Unknown){ bool pf=false; for(int f : plannedFlags){ if(f==m){ pf=true; break; } } if(pf) continue; list2[uc2++] = m; } }
+            if(uc2>0){ long double zeroProb = 1.0L; for(int t=0;t<uc2;++t){ double pm = probOf(list2[t]); zeroProb *= (long double)(1.0 - pm); } singleVal += (double)zeroProb * (double)uc2 * dampen; }
+            return singleVal;
+        };
+
+        auto computeBestKSingles = [&](const std::vector<int>& unknowns, const std::vector<int>& plannedFlags, int centerA, int centerB, double dampen, int K)->double{
+            if(K <= 0) return 0.0;
+            struct ValIdx { double v; int idx; };
+            std::vector<ValIdx> vals; vals.reserve(unknowns.size());
             for(int u : unknowns){
                 bool isPlannedFlag = false; for(int f : plannedFlags){ if(f==u){ isPlannedFlag=true; break; } }
                 if(isPlannedFlag) continue;
-                double pu = probOf(u);
-                double singleVal = (1.0 - pu);
-                int uc2=0; int list2[8];
-                for(int kk=0; kk<neighborCounts[u]; ++kk){ int m = neighbors[u][kk]; if(m==centerA || m==centerB) continue; if(cells[m]==CellState::Unknown){ bool pf=false; for(int f : plannedFlags){ if(f==m){ pf=true; break; } } if(pf) continue; list2[uc2++] = m; } }
-                if(uc2>0){ long double zeroProb = 1.0L; for(int t=0;t<uc2;++t){ double pm = probOf(list2[t]); zeroProb *= (long double)(1.0 - pm); } singleVal += (double)zeroProb * (double)uc2 * dampen; }
-                if(singleVal > bestSingle) bestSingle = singleVal;
+                double v = computeSingleValue(u, plannedFlags, centerA, centerB, dampen);
+                vals.push_back({v, u});
             }
-            return bestSingle;
+            if(vals.empty()) return 0.0;
+            std::nth_element(vals.begin(), vals.begin() + std::min<int>(K, (int)vals.size()) - 1, vals.end(), [](const ValIdx& a, const ValIdx& b){ return a.v > b.v; });
+            std::sort(vals.begin(), vals.begin() + std::min<int>(K, (int)vals.size()), [](const ValIdx& a, const ValIdx& b){ return a.v > b.v; });
+            double sum = 0.0; int take = std::min<int>(K, (int)vals.size());
+            for(int i=0;i<take;++i) sum += vals[i].v;
+            return sum;
         };
 
         std::vector<ChordCandidate> candidates; candidates.reserve(w*h/2);
@@ -543,7 +601,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                     }
                     if((int)certainFlags.size() != missing) continue; // cannot chord safely
                 } else {
-                    // If user just placed at least one neighbor flag, allow a break-even chord with 1 unknown
+                    // if user just placed at least one neighbor flag, allow a break-even chord with 1 unknown
                     // to persist planned action; otherwise require 2+ unknowns to ensure savings.
                     if(!((int)unknowns.size() >= 1 && userFlags > 0)){
                         if((int)unknowns.size() < 2) continue; // require savings when not in-progress
@@ -555,10 +613,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
 
                 auto ev = computeExpected(unknowns, certainFlags, idx, -1, kCascadeDampen);
                 double totalValue = ev.first + ev.second;
-                double bestSingle = computeBestSingle(unknowns, certainFlags, idx, -1, kCascadeDampen);
+                int budgetK = clicks; // alternative: spend the same number of clicks on best singles
+                double bestAltSingles = computeBestKSingles(unknowns, certainFlags, idx, -1, kCascadeDampen, budgetK);
 
                 bool inProgress = (missing==0 && (int)unknowns.size()==1 && userFlags>0);
-                candidates.push_back(ChordCandidate{ idx, missing, std::move(unknowns), std::move(certainFlags), clicks, totalValue, bestSingle, inProgress });
+                candidates.push_back(ChordCandidate{ idx, missing, std::move(unknowns), std::move(certainFlags), clicks, totalValue, bestAltSingles, inProgress });
             }
         }
 
@@ -602,20 +661,12 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                 auto evPair = computeExpected(unknownUnion, flagUnion, A.centerIdx, B.centerIdx, kCascadeDampen);
                 double pairValue = evPair.first + evPair.second;
 
-                // approximate best two singles alternative from union unknowns
-                // compute top two single values greedily without replacement
-                struct ValIdx { double v; int idx; };
-                std::vector<ValIdx> vals; vals.reserve(unknownUnion.size());
-                for(int u : unknownUnion){ bool isFlag=false; for(int f:flagUnion){ if(f==u){ isFlag=true; break; } } if(isFlag) continue; double pu = probOf(u); double v = (1.0 - pu);
-                    int uc2=0; int list2[8]; for(int kk=0; kk<neighborCounts[u]; ++kk){ int m = neighbors[u][kk]; if(m==A.centerIdx || m==B.centerIdx) continue; if(cells[m]==CellState::Unknown){ bool pf=false; for(int f:flagUnion){ if(f==m){ pf=true; break; } } if(pf) continue; list2[uc2++] = m; } }
-                    if(uc2>0){ long double zeroProb = 1.0L; for(int t=0;t<uc2;++t){ double pm = probOf(list2[t]); zeroProb *= (long double)(1.0 - pm); } v += (double)zeroProb * (double)uc2 * kCascadeDampen; }
-                    vals.push_back({v, u}); }
-                std::sort(vals.begin(), vals.end(), [](const ValIdx& a, const ValIdx& b){ return a.v>b.v; });
-                double bestTwoSingles = 0.0; if(!vals.empty()) bestTwoSingles += vals[0].v; if(vals.size()>1) bestTwoSingles += vals[1].v;
+                // baseline: spend the same number of clicks as the pair requires on the best singles
+                double bestKSinglesPair = computeBestKSingles(unknownUnion, flagUnion, A.centerIdx, B.centerIdx, kCascadeDampen, pairClicks);
 
-                double improvement = pairValue - std::max((double)pairClicks, bestTwoSingles);
+                double improvement = pairValue - bestKSinglesPair;
                 if(improvement > kMargin){
-                    pairPicks.push_back(PairPick{ i, j, pairClicks, pairValue, bestTwoSingles, improvement, std::move(flagUnion), std::move(unknownUnion) });
+                    pairPicks.push_back(PairPick{ i, j, pairClicks, pairValue, bestKSinglesPair, improvement, std::move(flagUnion), std::move(unknownUnion) });
                 }
             }
         }
@@ -633,14 +684,15 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             picked[p.a]=picked[p.b]=1;
         }
 
-        // Always keep in-progress single chords visible (user recently placed enabling flag)
+        // always keep in-progress single chords visible (user recently placed enabling flag)
         for(int i=0;i<(int)candidates.size();++i){ if(picked[i]) continue; const auto& C = candidates[i];
             if(C.inProgress){ if(ov.marks[C.centerIdx]==Mark::None) ov.marks[C.centerIdx]=Mark::Chord; picked[i]=1; }
         }
 
         // pick remaining profitable singles
         for(int i=0;i<(int)candidates.size();++i){ if(picked[i]) continue; const auto& C = candidates[i];
-            double improvement = C.expectedValue - std::max((double)C.clicks, C.bestSingle);
+            // baseline: same click budget on best singles
+            double improvement = C.expectedValue - C.bestSingle;
             if(improvement > kMargin){
                 if(ov.marks[C.centerIdx]==Mark::None) ov.marks[C.centerIdx]=Mark::Chord;
                 for(int f : C.flagList){ if(cells[f] != CellState::Mine){ ov.marks[f]=Mark::FlagForChord; } }
@@ -649,7 +701,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         }
     }
 
-        // If new certain marks were added via probabilities, re-run local propagation around them
+        // if new certain marks were added via probabilities, re-run local propagation around them
         if(!changedByProb.empty()){
             for(int idxChanged : changedByProb){ enqueueNbrNumbers(idxChanged); }
             while(!queue.empty()){
@@ -662,7 +714,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                 for(int k=0;k<neighborCounts[idxCenter];++k){
                     int nb2 = neighbors[idxCenter][k];
                     CellState s2 = cells[nb2];
-                    // Only count preexisting flags or deduced mines here; do not treat FlagForChord as flagged
+                    // only count preexisting flags or deduced mines here; do not treat FlagForChord as flagged
                     if(s2 == CellState::Mine || ov.marks[nb2] == Mark::Mine){ knownMines2++; continue; }
                     if(s2 == CellState::Unknown && ov.marks[nb2] != Mark::Safe){ unknownIdx2[ucount2++] = nb2; }
                 }
@@ -679,7 +731,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         }
         }
 
-        // If we still have neither safe moves nor probabilities to guide, fall back to a center guess
+        // if we still have neither safe moves nor probabilities to guide, fall back to a center guess
         if(!ov.hasGuaranteedSafe){
             bool anyGuess=false; for(const auto m : ov.marks){ if(m==Mark::Guess){ anyGuess=true; break; } }
             if(!anyGuess){
@@ -693,6 +745,3 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
 }
 
 }
-
-
-

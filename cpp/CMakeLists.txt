@@ -11,6 +11,8 @@ set(SRC
 
 add_executable(mines_overlay WIN32 ${SRC})
 
+set_target_properties(mines_overlay PROPERTIES OUTPUT_NAME "tihnt")
+
 target_include_directories(mines_overlay PRIVATE include)
 
 if(WIN32)
