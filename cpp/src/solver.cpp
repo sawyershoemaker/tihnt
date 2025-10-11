@@ -222,6 +222,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         for(int i=0;i<N;++i){ if(isFrontier[i]){ int r=findp(i); auto it=rootToCid.find(r); if(it==rootToCid.end()){ rootToCid[r]=compCount; compId[i]=compCount; compCount++; } else { compId[i]=it->second; } } }
 
         ov.mineProbability.assign(N, -1.0);
+        // Track which probabilities are logically certain (exactly 0 or 1) via exact enumeration
+        std::vector<uint8_t> probCertain(N, 0);
 
         struct Con { int num; int knownMines; std::vector<int> uidx; };
         struct CompData {
@@ -283,8 +285,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             if(C.enumerated && totalMines==0){
                 for(int t=0;t<C.m;++t){
                     long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += C.mineWaysPerCellK[t][k];
-                    if(mw <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; }
-                    else if(std::fabsl(mw - C.totalSolutions) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; }
+                    if(mw <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; probCertain[C.U[t]] = 1; }
+                    else if(std::fabsl(mw - C.totalSolutions) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; probCertain[C.U[t]] = 1; }
                     else { ov.mineProbability[C.U[t]] = (double)(mw / C.totalSolutions); }
                 }
             }
@@ -377,6 +379,102 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             }
         }
 
+        // SAT-style forcedness check for non-enumerated components to identify guaranteed Safe/Mine
+        {
+            bool anyForced = false;
+            for(int cid=0; cid<compCount; ++cid){
+                auto& C = comps[cid];
+                if(C.m==0 || (int)C.cons.size()==0) continue;
+                if(C.enumerated) continue;
+
+                // degree-ordered variables for stronger pruning
+                std::vector<int> degree(C.m, 0);
+                for(const auto& con : C.cons){ for(int ui : con.uidx){ if(ui>=0 && ui<C.m) degree[ui]++; } }
+                std::vector<int> order(C.m); for(int i=0;i<C.m;++i) order[i]=i;
+                std::sort(order.begin(), order.end(), [&](int a, int b){ if(degree[a]!=degree[b]) return degree[a]>degree[b]; return a<b; });
+
+                // base assignment from already deduced marks
+                std::vector<uint8_t> baseAssign(C.m, 255);
+                for(int t=0;t<C.m;++t){
+                    int g = C.U[t];
+                    if(g>=0 && g<N){
+                        if(ov.marks[g]==Mark::Mine) baseAssign[t]=1;
+                        else if(ov.marks[g]==Mark::Safe) baseAssign[t]=0;
+                    }
+                }
+
+                size_t nodeBudget = 500000; // guard against pathological blowups
+                std::function<bool(std::vector<uint8_t>&, int, size_t&)> dfsSat = [&](std::vector<uint8_t>& assign, int idx, size_t& budget)->bool{
+                    if(budget==0) return false;
+                    // local feasibility pruning
+                    for(const auto& con : C.cons){
+                        int need = con.num - con.knownMines;
+                        int placed=0, unk=0;
+                        for(int ui : con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
+                        if(need < placed) return false;
+                        if(need > placed + unk) return false;
+                    }
+                    if(idx==C.m) return true;
+                    int var = order[idx];
+                    if(assign[var] != 255){
+                        return dfsSat(assign, idx+1, budget);
+                    }
+                    assign[var]=0; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
+                    assign[var]=255;
+                    assign[var]=1; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
+                    assign[var]=255;
+                    return false;
+                };
+
+                auto isForced = [&](int varIdx)->int{ // -1 not forced, 0 forced safe, 1 forced mine
+                    if(baseAssign[varIdx]==0) return 0;
+                    if(baseAssign[varIdx]==1) return 1;
+                    std::vector<uint8_t> a0 = baseAssign; a0[varIdx]=0; size_t b0=nodeBudget;
+                    bool sat0 = dfsSat(a0, 0, b0);
+                    std::vector<uint8_t> a1 = baseAssign; a1[varIdx]=1; size_t b1=nodeBudget;
+                    bool sat1 = dfsSat(a1, 0, b1);
+                    if(sat0 && !sat1) return 0;
+                    if(!sat0 && sat1) return 1;
+                    return -1;
+                };
+
+                for(int t=0;t<C.m;++t){
+                    int forced = isForced(t);
+                    if(forced==0){
+                        int g = C.U[t]; if(ov.marks[g] != Mark::Safe){ ov.marks[g]=Mark::Safe; ov.hasGuaranteedSafe=true; enqueueNbrNumbers(g); anyForced=true; }
+                    } else if(forced==1){
+                        int g = C.U[t]; if(ov.marks[g] != Mark::Mine){ ov.marks[g] = Mark::Mine; enqueueNbrNumbers(g); anyForced=true; }
+                    }
+                }
+            }
+
+            // propagate around newly forced marks immediately
+            if(anyForced){
+                while(!queue.empty()){
+                    int idxCenter = queue.back(); queue.pop_back(); inQueue[idxCenter]=0;
+                    int y2 = idxCenter / w; (void)y2; int x2 = idxCenter % w; (void)x2;
+                    int num2 = numbers[idxCenter];
+                    if(num2 < 0) continue;
+                    int knownMines2 = 0;
+                    int unknownIdx2[8]; int ucount2 = 0;
+                    for(int k=0;k<neighborCounts[idxCenter];++k){
+                        int nb2 = neighbors[idxCenter][k];
+                        CellState s2 = cells[nb2];
+                        // only count preexisting flags or deduced mines here; do not treat FlagForChord as flagged
+                        if(s2 == CellState::Mine || ov.marks[nb2] == Mark::Mine){ knownMines2++; continue; }
+                        if(s2 == CellState::Unknown && ov.marks[nb2] != Mark::Safe){ unknownIdx2[ucount2++] = nb2; }
+                    }
+                    int remaining2 = num2 - knownMines2;
+                    if(remaining2 < 0 || remaining2 > ucount2){ continue; }
+                    if(remaining2 == 0 && ucount2 > 0){
+                        for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} }
+                    } else if(remaining2 == ucount2 && ucount2>0){
+                        for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] == Mark::FlagForChord){ continue; } if(ov.marks[u] != Mark::Mine){ ov.marks[u] = Mark::Mine; enqueueNbrNumbers(u);} }
+                    }
+                }
+            }
+        }
+
         bool anyEnumerated=false; for(const auto& C : comps){ if(C.enumerated){ anyEnumerated=true; break; } }
         if(totalMines>0 && anyEnumerated){
             int knownGlobal=0, unknownGlobal=0; for(int i=0;i<N;++i){ if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) knownGlobal++; else if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Safe) unknownGlobal++; }
@@ -407,8 +505,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                                 numer += C.mineWaysPerCellK[t][k] * other[rOther] * combFree[needOut];
                             }
                         }
-                        if(numer <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; }
-                        else if(std::fabsl(numer - totalWeight) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; }
+                        if(numer <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; probCertain[C.U[t]] = 1; }
+                        else if(std::fabsl(numer - totalWeight) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; probCertain[C.U[t]] = 1; }
                         else { ov.mineProbability[C.U[t]] = (double)(numer / totalWeight); }
                     }
                 }
@@ -474,15 +572,16 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         }
         std::vector<int> changedByProb; changedByProb.reserve(N/8+1);
         if(hasProb && std::isfinite(bestProb)){
-            const double eps=1e-6;
+            // Only convert to Safe/Mine when probabilities are logically certain (from exact enumeration)
             for(int i=0;i<N;++i){
-                if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){
-                    if(ov.mineProbability[i] <= eps){ if(ov.marks[i]!=Mark::Safe){ ov.marks[i]=Mark::Safe; ov.hasGuaranteedSafe = true; changedByProb.push_back(i); } }
-                    else if(ov.mineProbability[i] >= 1.0 - eps){ if(ov.marks[i]!=Mark::Mine){ ov.marks[i]=Mark::Mine; changedByProb.push_back(i); } }
+                if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0 && probCertain[i]){
+                    if(ov.mineProbability[i] == 0.0){ if(ov.marks[i]!=Mark::Safe){ ov.marks[i]=Mark::Safe; ov.hasGuaranteedSafe = true; changedByProb.push_back(i); } }
+                    else if(ov.mineProbability[i] == 1.0){ if(ov.marks[i]!=Mark::Mine){ ov.marks[i]=Mark::Mine; changedByProb.push_back(i); } }
                 }
             }
             // only set Guess when no guaranteed safe exists
             if(!ov.hasGuaranteedSafe){
+                const double eps = 1e-9;
                 for(int i=0;i<N;++i){
                     if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){
                         if(std::abs(ov.mineProbability[i] - bestProb) <= eps){ ov.marks[i]=Mark::Guess; }
