@@ -21,8 +21,8 @@ TIHNT or the Tile Information & Hidden Node Toolkit (holy backronym) is a day-ma
 - **Ctrl + Alt + S** — Toggle safety
 - **Ctrl + Q**— Bind overlay to PID of browser
 
-## privacy
-- websocket is lightweight and only runs locally, mostly for speed but you also don't need to worry about me having ur game data
+## compiling..
+```cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON``` and make sure you're compiling for x64
 ---
 
 > originally tried to make this with opencv but the themes were so ugly on the site i had to parse DOM information and deltas to a websocket just to get a working overlay.
