@@ -109,7 +109,7 @@ int main(){
             }
             int minesTotal = g_mines_total.load();
             bool enableChords = g_enable_chords.load();
-            solve::Overlay ov = solve::compute_overlay(snapshot, minesTotal, enableChords);
+            solve::Overlay ov = solve::compute_overlay(snapshot, minesTotal, enableChords, 0);
             overlay.update(ov.marks, gcopy, minesTotal);
             didWork = true;
         }
@@ -123,7 +123,7 @@ int main(){
                 gcopy = geom;
             }
             int minesTotal = g_mines_total.load();
-            solve::Overlay ov = solve::compute_overlay(snapshot, minesTotal, false);
+            solve::Overlay ov = solve::compute_overlay(snapshot, minesTotal, false, 0);
             overlay.update(ov.marks, gcopy, minesTotal);
         }
     }

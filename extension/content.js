@@ -237,6 +237,29 @@
     } catch (e) { log('tick error', String(e)); }
   }
 
+  // respond to background "force_full" command
+  try {
+    chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+      try {
+        if (msg && msg.type === 'force_full') {
+          const s = capture();
+          if (!s) { respond && respond({ ok: false }); return; }
+          // Always send full regardless of timer/size change
+          const cells = s.bombDetected ? new Array(s.w * s.h).fill(0) : s.states;
+          const full = { type: 'full', w: s.w, h: s.h, cells, cell_px: s.cellPx, ox: s.origin.x, oy: s.origin.y, mines_total: STATE.minesTotal,
+            rect_l: s.rect.l, rect_t: s.rect.t, rect_w: s.rect.w, rect_h: s.rect.h,
+            vv_x: s.vv.x, vv_y: s.vv.y, vv_scale: s.vv.scale, dpr: window.devicePixelRatio || 1 };
+          log('force_full send', { w: s.w, h: s.h, cellsLen: cells.length, cellPx: s.cellPx });
+          chrome.runtime.sendMessage(full, () => {});
+          STATE.last = cells;
+          STATE.w = s.w; STATE.h = s.h; STATE.origin = s.origin; STATE.cellPx = s.cellPx; STATE.lastFullSent = Date.now();
+          respond && respond({ ok: true });
+          return;
+        }
+      } catch {}
+    });
+  } catch {}
+
   setInterval(tick, 200);
   const vv = window.visualViewport;
   if (vv) {

@@ -18,11 +18,13 @@ TIHNT or the Tile Information & Hidden Node Toolkit (holy backronym) is a projec
 - **Ctrl + P** — Toggle chording
 - **Ctrl + W**— Toggle stream-proof mode
 - **Ctrl + Alt + S** — Toggle safety
-- **Ctrl + Q**— Bind overlay to PID of browser // broken rn
+- **Ctrl + Q**— Resend full board
 
 ## compiling..
-```cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON``` 
-and make sure you're compiling for x64
+```cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_FLAGS_RELEASE="/O2 /Ot /Ob3 /DNDEBUG /arch:AVX2 /fp:precise"``` 
+
+and make sure you're compiling for x64, also if u cant use AVX2, use `/arch:SSE2`
+
 ---
 
-> originally tried to make this with opencv but the themes were so ugly on the site i had to parse DOM information and deltas to a websocket just to get a working overlay.
+> 

@@ -236,7 +236,4 @@ bool WebSocketServer::send_text(const std::string& data){
     return false;
 #endif
 }
-
 }
-
-

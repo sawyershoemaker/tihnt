@@ -6,6 +6,8 @@
 #include <functional>
 #include <limits>
 #include <unordered_map>
+#include <thread>
+#include <atomic>
 
 namespace solve {
 
@@ -23,7 +25,7 @@ static inline int cell_number(CellState s){
 	return -1;
 }
 
-Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
+Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, int threads){
 	Overlay ov{};
 	const int w = board.width();
 	const int h = board.height();
@@ -217,12 +219,19 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             for(int k=0;k<neighborCounts[idx];++k){ int nb=neighbors[idx][k]; if(isFrontier[nb]) ulist[uc++]=nb; }
             for(int a=1;a<uc;++a) unite(ulist[0], ulist[a]);
         } }
-        std::unordered_map<int,int> rootToCid; rootToCid.reserve(N/4+1);
+        std::vector<int> rootToCid(N, -1);
         int compCount=0;
-        for(int i=0;i<N;++i){ if(isFrontier[i]){ int r=findp(i); auto it=rootToCid.find(r); if(it==rootToCid.end()){ rootToCid[r]=compCount; compId[i]=compCount; compCount++; } else { compId[i]=it->second; } } }
+        for(int i=0;i<N;++i){
+            if(isFrontier[i]){
+                int r = findp(i);
+                int mapped = rootToCid[r];
+                if(mapped==-1){ mapped = compCount; rootToCid[r] = compCount; compCount++; }
+                compId[i] = mapped;
+            }
+        }
 
         ov.mineProbability.assign(N, -1.0);
-        // Track which probabilities are logically certain (exactly 0 or 1) via exact enumeration
+        // track which probabilities are logically certain (exactly 0 or 1) via exact enumeration
         std::vector<uint8_t> probCertain(N, 0);
 
         struct Con { int num; int knownMines; std::vector<int> uidx; };
@@ -248,21 +257,39 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         } }
 
         const int ENUM_CAP = 26;
-        for(int cid=0; cid<compCount; ++cid){
+
+        struct CompResult {
+            bool enumerated = false;
+            std::vector<long double> waysK;
+            std::vector<std::vector<long double>> mineWaysPerCellK;
+            long double totalSolutions = 0.0L;
+            std::vector<double> beliefs; // size m, [-1 if unknown]
+            std::vector<uint8_t> probCertainBits; // size m
+            std::vector<int> forcedSafe; // global indices
+            std::vector<int> forcedMine; // global indices
+        };
+
+        std::vector<CompResult> compResults(compCount);
+
+        auto process_component = [&](int cid){
+            CompResult R;
             auto& C = comps[cid];
             C.m = (int)C.U.size();
-            if(C.m==0 || (int)C.cons.size()==0){ C.enumerated=false; continue; }
-            if(C.m > ENUM_CAP){ C.enumerated=false; continue; }
-            C.waysK.assign(C.m+1, 0.0L);
-            C.mineWaysPerCellK.assign(C.m, std::vector<long double>(C.m+1, 0.0L));
-            std::vector<uint8_t> assign(C.m, 255);
-            // order variables by descending degree (number of constraints touching them) to reduce branching
+            if(C.m==0 || (int)C.cons.size()==0){ compResults[cid] = std::move(R); return; }
+
+            // degree order once
             std::vector<int> degree(C.m, 0);
             for(const auto& con : C.cons){ for(int ui : con.uidx){ if(ui>=0 && ui<C.m) degree[ui]++; } }
             std::vector<int> order(C.m); for(int i=0;i<C.m;++i) order[i]=i;
             std::sort(order.begin(), order.end(), [&](int a, int b){ if(degree[a]!=degree[b]) return degree[a]>degree[b]; return a<b; });
+
+            if(C.m <= ENUM_CAP){
+                // exact enumeration
+                R.enumerated = true;
+                R.waysK.assign(C.m+1, 0.0L);
+                R.mineWaysPerCellK.assign(C.m, std::vector<long double>(C.m+1, 0.0L));
+                std::vector<uint8_t> assign(C.m, 255);
             std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
-                // local feasibility against all constraints
                 for(const auto& con : C.cons){
                     int need = con.num - con.knownMines;
                     int placed=0, unk=0;
@@ -270,9 +297,9 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                     if(need < placed) return; if(need > placed + unk) return;
                 }
                 if(idx==C.m){
-                    C.totalSolutions += 1.0L;
-                    C.waysK[minesSoFar] += 1.0L;
-                    for(int t=0;t<C.m;++t){ if(assign[t]==1) C.mineWaysPerCellK[t][minesSoFar] += 1.0L; }
+                        R.totalSolutions += 1.0L;
+                        R.waysK[minesSoFar] += 1.0L;
+                        for(int t=0;t<C.m;++t){ if(assign[t]==1) R.mineWaysPerCellK[t][minesSoFar] += 1.0L; }
                     return;
                 }
                 int var = order[idx];
@@ -281,14 +308,122 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
                 assign[var]=255;
             };
             dfs(0,0);
-            C.enumerated = (C.totalSolutions > 0.0L);
-            if(C.enumerated && totalMines==0){
+                // local probabilities if totalMines==0
+                if(R.totalSolutions > 0.0L && totalMines==0){
+                    R.beliefs.assign(C.m, 0.5);
+                    R.probCertainBits.assign(C.m, 0);
                 for(int t=0;t<C.m;++t){
-                    long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += C.mineWaysPerCellK[t][k];
-                    if(mw <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; probCertain[C.U[t]] = 1; }
-                    else if(std::fabsl(mw - C.totalSolutions) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; probCertain[C.U[t]] = 1; }
-                    else { ov.mineProbability[C.U[t]] = (double)(mw / C.totalSolutions); }
+                        long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += R.mineWaysPerCellK[t][k];
+                        if(mw <= 0.0L){ R.beliefs[t] = 0.0; R.probCertainBits[t]=1; }
+                        else if(std::fabsl(mw - R.totalSolutions) <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
+                        else { R.beliefs[t] = (double)(mw / R.totalSolutions); }
+                    }
                 }
+            } else {
+                // build variable-to-constraint adjacency
+                struct EdgeRef { int conIndex; int posInCon; };
+                std::vector<std::vector<EdgeRef>> varEdges(C.m);
+                for(int j=0;j<(int)C.cons.size();++j){ const auto& con=C.cons[j]; for(int p=0;p<(int)con.uidx.size();++p){ int v=con.uidx[p]; varEdges[v].push_back({j,p}); } }
+                auto findEdgeIndex = [&](int v, int conIndex)->int{ const auto& edges=varEdges[v]; for(int i=0;i<(int)edges.size();++i){ if(edges[i].conIndex==conIndex) return i; } return -1; };
+                std::vector<std::vector<double>> vToF(C.m), fToV(C.cons.size());
+                for(int v=0; v<C.m; ++v){ vToF[v].assign(varEdges[v].size(), 0.5); }
+                for(size_t j=0;j<C.cons.size();++j){ fToV[j].assign(C.cons[j].uidx.size(), 0.5); }
+                const int BP_MAX_ITERS = 20; const double BP_DAMP = 0.5; const double BP_EPS = 1e-6;
+                for(int it=0; it<BP_MAX_ITERS; ++it){
+                    for(int j=0;j<(int)C.cons.size(); ++j){
+                        const auto& con = C.cons[j];
+                        const int s = (int)con.uidx.size();
+                        const int need = con.num - con.knownMines;
+                        for(int p=0; p<s; ++p){
+                            std::vector<long double> dp(s, 0.0L); dp[0]=1.0L;
+                            for(int q=0; q<s; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=findEdgeIndex(vv,j); double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
+                                std::vector<long double> ndp(s, 0.0L);
+                                for(int k=0;k<s-1;++k){ if(dp[k]==0.0L) continue; ndp[k] += dp[k]*(1.0L-(long double)prob); ndp[k+1]+=dp[k]*(long double)prob; }
+                                dp.swap(ndp);
+                            }
+                            long double A=0.0L,B=0.0L; if(need-1>=0 && need-1<=s-1) A=dp[need-1]; if(need>=0 && need<=s-1) B=dp[need];
+                            double msg=0.5; if(A==0.0L && B==0.0L) msg=0.5; else if(A==0.0L) msg=0.0; else if(B==0.0L) msg=1.0; else { double a=(double)A,b=(double)B; msg=a/(a+b);} 
+                            msg = BP_DAMP * fToV[j][p] + (1.0 - BP_DAMP) * std::min(1.0-1e-9, std::max(1e-9, msg));
+                            fToV[j][p] = msg;
+                        }
+                    }
+                    for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); if(deg==0) continue; std::vector<double> pref1(deg+1,1.0),pref0(deg+1,1.0); for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; pref1[i+1]=pref1[i]*m1; pref0[i+1]=pref0[i]*(1.0-m1);} std::vector<double> suf1(deg+1,1.0),suf0(deg+1,1.0); for(int i=deg-1;i>=0;--i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; suf1[i]=suf1[i+1]*m1; suf0[i]=suf0[i+1]*(1.0-m1);} for(int i=0;i<deg;++i){ double p1=pref1[i]*suf1[i+1]; double p0=pref0[i]*suf0[i+1]; double msg=(p1==0.0 && p0==0.0)?0.5:(p1/(p1+p0)); msg=std::min(1.0-BP_EPS, std::max(BP_EPS, msg)); vToF[v][i] = BP_DAMP * vToF[v][i] + (1.0 - BP_DAMP) * msg; } }
+                }
+                R.beliefs.assign(C.m, 0.5);
+                for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); double prod1=1.0,prod0=1.0; for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; prod1*=m1; prod0*=(1.0-m1);} double p = (prod1==0.0&&prod0==0.0)?0.5:(prod1/(prod1+prod0)); p=std::min(1.0-BP_EPS, std::max(BP_EPS, p)); R.beliefs[v]=p; }
+            }
+
+            // optional SAT forcedness for non-enumerated components
+            if(C.m>0 && (int)C.cons.size()>0 && !R.enumerated){
+                std::vector<uint8_t> baseAssign(C.m, 255);
+                for(int t=0;t<C.m;++t){ int g=C.U[t]; if(g>=0 && g<N){ if(ov.marks[g]==Mark::Mine) baseAssign[t]=1; else if(ov.marks[g]==Mark::Safe) baseAssign[t]=0; } }
+                std::vector<int> degree2(C.m,0); for(const auto& con:C.cons){ for(int ui:con.uidx){ if(ui>=0 && ui<C.m) degree2[ui]++; } }
+                std::vector<int> order2(C.m); for(int i=0;i<C.m;++i) order2[i]=i; std::sort(order2.begin(), order2.end(), [&](int a,int b){ if(degree2[a]!=degree2[b]) return degree2[a]>degree2[b]; return a<b; });
+                size_t nodeBudget = 500000;
+                std::function<bool(std::vector<uint8_t>&, int, size_t&)> dfsSat = [&](std::vector<uint8_t>& assign, int idx, size_t& budget)->bool{
+                    if(budget==0) return false;
+                    for(const auto& con : C.cons){ int need=con.num - con.knownMines; int placed=0, unk=0; for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; } if(need < placed) return false; if(need > placed + unk) return false; }
+                    if(idx==C.m) return true;
+                    int var = order2[idx]; if(assign[var]!=255) return dfsSat(assign, idx+1, budget);
+                    assign[var]=0; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
+                    assign[var]=255; assign[var]=1; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
+                    assign[var]=255; return false;
+                };
+                auto isForced = [&](int varIdx)->int{
+                    if(baseAssign[varIdx]==0) return 0; if(baseAssign[varIdx]==1) return 1; std::vector<uint8_t> a0=baseAssign; a0[varIdx]=0; size_t b0=nodeBudget; bool sat0=dfsSat(a0,0,b0); std::vector<uint8_t> a1=baseAssign; a1[varIdx]=1; size_t b1=nodeBudget; bool sat1=dfsSat(a1,0,b1); if(sat0 && !sat1) return 0; if(!sat0 && sat1) return 1; return -1; };
+                for(int t=0;t<C.m;++t){ int forced=isForced(t); if(forced==0) R.forcedSafe.push_back(C.U[t]); else if(forced==1) R.forcedMine.push_back(C.U[t]); }
+            }
+
+            compResults[cid] = std::move(R);
+        };
+
+        int threadCount = threads;
+        if(threadCount <= 0){ threadCount = (int)std::thread::hardware_concurrency(); if(threadCount<=0) threadCount = 1; }
+        if(compCount < 2) threadCount = 1;
+
+        if(threadCount == 1){
+            for(int cid=0; cid<compCount; ++cid){ process_component(cid); }
+        } else {
+            std::atomic<int> nextCid{0};
+            std::vector<std::thread> ths; ths.reserve(threadCount);
+            for(int t=0;t<threadCount;++t){
+                ths.emplace_back([&](){ for(;;){ int cid = nextCid.fetch_add(1); if(cid>=compCount) break; process_component(cid); } });
+            }
+            for(auto& th : ths) th.join();
+        }
+
+        // apply forced marks from SAT and enumerated 0/1 certainty
+        bool anyForced=false;
+        for(int cid=0; cid<compCount; ++cid){
+            const auto& C = comps[cid];
+            const auto& R = compResults[cid];
+            for(int g : R.forcedSafe){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Safe){ ov.marks[g]=Mark::Safe; anyForced=true; enqueueNbrNumbers(g);} } }
+            for(int g : R.forcedMine){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Mine){ ov.marks[g]=Mark::Mine; anyForced=true; enqueueNbrNumbers(g);} } }
+            if(R.enumerated && totalMines==0 && !R.beliefs.empty()){
+                for(int t=0;t<C.m;++t){ int g=C.U[t]; double p=R.beliefs[t]; ov.mineProbability[g]=p; if(t<(int)R.probCertainBits.size() && R.probCertainBits[t]) probCertain[g]=1; }
+            }
+        }
+        if(anyForced){
+            while(!queue.empty()){
+                int idxCenter = queue.back(); queue.pop_back(); inQueue[idxCenter]=0;
+                int num2 = numbers[idxCenter]; if(num2 < 0) continue;
+                int knownMines2 = 0; int unknownIdx2[8]; int ucount2 = 0;
+                for(int k=0;k<neighborCounts[idxCenter];++k){ int nb2=neighbors[idxCenter][k]; CellState s2=cells[nb2]; if(s2==CellState::Mine || ov.marks[nb2]==Mark::Mine){ knownMines2++; continue; } if(s2==CellState::Unknown && ov.marks[nb2]!=Mark::Safe){ unknownIdx2[ucount2++]=nb2; } }
+                int remaining2 = num2 - knownMines2; if(remaining2 < 0 || remaining2 > ucount2) continue;
+                if(remaining2 == 0 && ucount2 > 0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} } }
+                else if(remaining2 == ucount2 && ucount2>0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Mine){ ov.marks[u]=Mark::Mine; enqueueNbrNumbers(u);} } }
+            }
+        }
+
+        // expose enumerated results to comps for global combination step
+        for(int cid=0; cid<compCount; ++cid){
+            auto& C = comps[cid];
+            const auto& R = compResults[cid];
+            if(R.enumerated){
+                C.enumerated = true;
+                C.waysK = R.waysK;
+                C.mineWaysPerCellK = R.mineWaysPerCellK;
+                C.totalSolutions = R.totalSolutions;
             }
         }
 
@@ -379,7 +514,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
             }
         }
 
-        // SAT-style forcedness check for non-enumerated components to identify guaranteed Safe/Mine
+        // sat-style forcedness check for non-enumerated components to identify guaranteed Safe/Mine
         {
             bool anyForced = false;
             for(int cid=0; cid<compCount; ++cid){
@@ -572,7 +707,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords){
         }
         std::vector<int> changedByProb; changedByProb.reserve(N/8+1);
         if(hasProb && std::isfinite(bestProb)){
-            // Only convert to Safe/Mine when probabilities are logically certain (from exact enumeration)
+            // only convert to Safe/Mine when probabilities are logically certain (from exact enumeration)
             for(int i=0;i<N;++i){
                 if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0 && probCertain[i]){
                     if(ov.mineProbability[i] == 0.0){ if(ov.marks[i]!=Mark::Safe){ ov.marks[i]=Mark::Safe; ov.hasGuaranteedSafe = true; changedByProb.push_back(i); } }

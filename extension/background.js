@@ -58,26 +58,20 @@ chrome.commands.onCommand.addListener((cmd) => {
       console.log('[mines-ext/bg]', 'toggled debug to', next);
     });
   }
-  if (cmd === 'bind-overlay-to-tab') {
+  if (cmd === 'force-resend-board') {
     try {
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const tab = tabs && tabs[0];
-        if (!tab) { log('no active tab for bind'); return; }
-        // Obtain PID via chrome.processes API
+        if (!tab) { log('force-resend: no active tab'); return; }
         try {
-          const procs = await chrome.processes.getProcessIdForTab(tab.id);
-          const pid = Number(procs);
-          if (!Number.isFinite(pid) || pid <= 0) { log('bind: invalid pid', procs); return; }
-          if (!connected || !socket || socket.readyState !== WebSocket.OPEN) { log('bind: ws not open'); return; }
-          const payload = JSON.stringify({ type: 'bind', pid });
-          log('bind send', payload);
-          socket.send(payload);
+          log('force-resend: requesting full snapshot on tab', tab.id);
+          chrome.tabs.sendMessage(tab.id, { type: 'force_full' }, () => {});
         } catch (e) {
-          log('bind error', String(e));
+          log('force-resend error', String(e));
         }
       });
     } catch (e) {
-      log('bind cmd error', String(e));
+      log('force-resend cmd error', String(e));
     }
   }
 });

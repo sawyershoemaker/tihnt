@@ -15,7 +15,7 @@ struct Overlay {
 	std::vector<double> mineProbability;
 };
 
-Overlay compute_overlay(const game::Board& board, int totalMines=0, bool enableChords=true);
+Overlay compute_overlay(const game::Board& board, int totalMines=0, bool enableChords=true, int threads=0);
 
 }
 

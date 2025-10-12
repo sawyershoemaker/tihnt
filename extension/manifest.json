@@ -3,7 +3,7 @@
   "name": "TIHNT",
   "version": "0.0",
   "description": "Tile Information & Hidden Node Toolkit",
-  "permissions": ["storage", "scripting", "activeTab", "processes"],
+  "permissions": ["storage", "scripting", "activeTab"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
@@ -22,11 +22,11 @@
       },
       "description": "Toggle debug logging"
     },
-    "bind-overlay-to-tab": {
+    "force-resend-board": {
       "suggested_key": {
         "default": "Ctrl+Q"
       },
-      "description": "Send current tab's PID to overlay"
+      "description": "Force resend full board from the current tab"
     }
   }
 }
