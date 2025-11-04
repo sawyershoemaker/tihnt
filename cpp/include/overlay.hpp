@@ -74,7 +74,7 @@ private:
 #endif
     std::vector<solve::Mark> marks_;
     OverlayGeometry geom_{};
-    int mines_total_ = 0;
+	int mines_total_ = -1;
     bool excluded_from_capture_ = false;
     bool visible_ = true;
     bool safety_mode_ = false;

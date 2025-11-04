@@ -26,7 +26,9 @@ static inline int cell_number(CellState s){
 }
 
 Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, int threads){
+	constexpr int UNKNOWN_TOTAL = -1;
 	Overlay ov{};
+	if(totalMines < UNKNOWN_TOTAL) totalMines = UNKNOWN_TOTAL;
 	const int w = board.width();
 	const int h = board.height();
 	const int N = w * h;
@@ -34,8 +36,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
 	if(w==0 || h==0) return ov;
 
-    struct NeighborCache { int w=-1, h=-1; std::vector<std::array<int,8>> nbr; std::vector<int> cnt; };
-    static NeighborCache cache;
+	struct NeighborCache { int w=-1, h=-1; std::vector<std::array<int,8>> nbr; std::vector<int> cnt; };
+	thread_local NeighborCache cache;
     if(cache.w!=w || cache.h!=h){
         cache.w=w; cache.h=h; cache.nbr.assign(N, {}); cache.cnt.assign(N, 0);
         for(int y=0;y<h;++y){
@@ -256,7 +258,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             comps[cid].cons.push_back(std::move(con));
         } }
 
-        const int ENUM_CAP = 26;
+	const int ENUM_MAX_VARS = 32;
+	const size_t ENUM_NODE_BUDGET = 8000000;
 
         struct CompResult {
             bool enumerated = false;
@@ -283,75 +286,90 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             std::vector<int> order(C.m); for(int i=0;i<C.m;++i) order[i]=i;
             std::sort(order.begin(), order.end(), [&](int a, int b){ if(degree[a]!=degree[b]) return degree[a]>degree[b]; return a<b; });
 
-            if(C.m <= ENUM_CAP){
-                // exact enumeration
-                R.enumerated = true;
-                R.waysK.assign(C.m+1, 0.0L);
-                R.mineWaysPerCellK.assign(C.m, std::vector<long double>(C.m+1, 0.0L));
-                std::vector<uint8_t> assign(C.m, 255);
-            std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
-                for(const auto& con : C.cons){
-                    int need = con.num - con.knownMines;
-                    int placed=0, unk=0;
-                    for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
-                    if(need < placed) return; if(need > placed + unk) return;
-                }
-                if(idx==C.m){
-                        R.totalSolutions += 1.0L;
-                        R.waysK[minesSoFar] += 1.0L;
-                        for(int t=0;t<C.m;++t){ if(assign[t]==1) R.mineWaysPerCellK[t][minesSoFar] += 1.0L; }
-                    return;
-                }
-                int var = order[idx];
-                assign[var]=0; dfs(idx+1, minesSoFar);
-                assign[var]=1; dfs(idx+1, minesSoFar+1);
-                assign[var]=255;
-            };
-            dfs(0,0);
-                // local probabilities if totalMines==0
-                if(R.totalSolutions > 0.0L && totalMines==0){
-                    R.beliefs.assign(C.m, 0.5);
-                    R.probCertainBits.assign(C.m, 0);
-                for(int t=0;t<C.m;++t){
-                        long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += R.mineWaysPerCellK[t][k];
-                        if(mw <= 0.0L){ R.beliefs[t] = 0.0; R.probCertainBits[t]=1; }
-                        else if(std::fabsl(mw - R.totalSolutions) <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
-                        else { R.beliefs[t] = (double)(mw / R.totalSolutions); }
-                    }
-                }
-            } else {
-                // build variable-to-constraint adjacency
-                struct EdgeRef { int conIndex; int posInCon; };
-                std::vector<std::vector<EdgeRef>> varEdges(C.m);
-                for(int j=0;j<(int)C.cons.size();++j){ const auto& con=C.cons[j]; for(int p=0;p<(int)con.uidx.size();++p){ int v=con.uidx[p]; varEdges[v].push_back({j,p}); } }
-                auto findEdgeIndex = [&](int v, int conIndex)->int{ const auto& edges=varEdges[v]; for(int i=0;i<(int)edges.size();++i){ if(edges[i].conIndex==conIndex) return i; } return -1; };
-                std::vector<std::vector<double>> vToF(C.m), fToV(C.cons.size());
-                for(int v=0; v<C.m; ++v){ vToF[v].assign(varEdges[v].size(), 0.5); }
-                for(size_t j=0;j<C.cons.size();++j){ fToV[j].assign(C.cons[j].uidx.size(), 0.5); }
-                const int BP_MAX_ITERS = 20; const double BP_DAMP = 0.5; const double BP_EPS = 1e-6;
-                for(int it=0; it<BP_MAX_ITERS; ++it){
-                    for(int j=0;j<(int)C.cons.size(); ++j){
-                        const auto& con = C.cons[j];
-                        const int s = (int)con.uidx.size();
-                        const int need = con.num - con.knownMines;
-                        for(int p=0; p<s; ++p){
-                            std::vector<long double> dp(s, 0.0L); dp[0]=1.0L;
-                            for(int q=0; q<s; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=findEdgeIndex(vv,j); double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
-                                std::vector<long double> ndp(s, 0.0L);
-                                for(int k=0;k<s-1;++k){ if(dp[k]==0.0L) continue; ndp[k] += dp[k]*(1.0L-(long double)prob); ndp[k+1]+=dp[k]*(long double)prob; }
-                                dp.swap(ndp);
-                            }
-                            long double A=0.0L,B=0.0L; if(need-1>=0 && need-1<=s-1) A=dp[need-1]; if(need>=0 && need<=s-1) B=dp[need];
-                            double msg=0.5; if(A==0.0L && B==0.0L) msg=0.5; else if(A==0.0L) msg=0.0; else if(B==0.0L) msg=1.0; else { double a=(double)A,b=(double)B; msg=a/(a+b);} 
-                            msg = BP_DAMP * fToV[j][p] + (1.0 - BP_DAMP) * std::min(1.0-1e-9, std::max(1e-9, msg));
-                            fToV[j][p] = msg;
-                        }
-                    }
-                    for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); if(deg==0) continue; std::vector<double> pref1(deg+1,1.0),pref0(deg+1,1.0); for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; pref1[i+1]=pref1[i]*m1; pref0[i+1]=pref0[i]*(1.0-m1);} std::vector<double> suf1(deg+1,1.0),suf0(deg+1,1.0); for(int i=deg-1;i>=0;--i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; suf1[i]=suf1[i+1]*m1; suf0[i]=suf0[i+1]*(1.0-m1);} for(int i=0;i<deg;++i){ double p1=pref1[i]*suf1[i+1]; double p0=pref0[i]*suf0[i+1]; double msg=(p1==0.0 && p0==0.0)?0.5:(p1/(p1+p0)); msg=std::min(1.0-BP_EPS, std::max(BP_EPS, msg)); vToF[v][i] = BP_DAMP * vToF[v][i] + (1.0 - BP_DAMP) * msg; } }
-                }
-                R.beliefs.assign(C.m, 0.5);
-                for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); double prod1=1.0,prod0=1.0; for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; prod1*=m1; prod0*=(1.0-m1);} double p = (prod1==0.0&&prod0==0.0)?0.5:(prod1/(prod1+prod0)); p=std::min(1.0-BP_EPS, std::max(BP_EPS, p)); R.beliefs[v]=p; }
-            }
+			bool needApprox = true;
+			if(C.m <= ENUM_MAX_VARS){
+				// exact enumeration with guard against state explosion
+				R.totalSolutions = 0.0L;
+				R.waysK.assign(C.m+1, 0.0L);
+				R.mineWaysPerCellK.assign(C.m, std::vector<long double>(C.m+1, 0.0L));
+				std::vector<uint8_t> assign(C.m, 255);
+				size_t nodeBudget = ENUM_NODE_BUDGET;
+				bool aborted = false;
+			std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
+				if(aborted) return;
+				if(nodeBudget == 0){ aborted = true; return; }
+				--nodeBudget;
+				for(const auto& con : C.cons){
+					int need = con.num - con.knownMines;
+					int placed=0, unk=0;
+					for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
+					if(need < placed) return; if(need > placed + unk) return;
+				}
+				if(idx==C.m){
+					R.totalSolutions += 1.0L;
+					R.waysK[minesSoFar] += 1.0L;
+					for(int t=0;t<C.m;++t){ if(assign[t]==1) R.mineWaysPerCellK[t][minesSoFar] += 1.0L; }
+					return;
+				}
+				int var = order[idx];
+				assign[var]=0; dfs(idx+1, minesSoFar);
+				if(aborted) return;
+				assign[var]=1; dfs(idx+1, minesSoFar+1);
+				assign[var]=255;
+			};
+				dfs(0,0);
+				if(!aborted && R.totalSolutions > 0.0L){
+					R.enumerated = true;
+					needApprox = false;
+					R.beliefs.assign(C.m, 0.5);
+					R.probCertainBits.assign(C.m, 0);
+					for(int t=0;t<C.m;++t){
+						long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += R.mineWaysPerCellK[t][k];
+						if(mw <= 0.0L){ R.beliefs[t] = 0.0; R.probCertainBits[t]=1; }
+						else if(std::fabsl(mw - R.totalSolutions) <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
+						else { R.beliefs[t] = (double)(mw / R.totalSolutions); }
+					}
+				} else {
+					R.enumerated = false;
+					R.totalSolutions = 0.0L;
+					R.waysK.clear();
+					R.mineWaysPerCellK.clear();
+					R.probCertainBits.clear();
+				}
+			}
+			if(needApprox){
+				// belief propagation fallback
+				struct EdgeRef { int conIndex; int posInCon; };
+				std::vector<std::vector<EdgeRef>> varEdges(C.m);
+				for(int j=0;j<(int)C.cons.size();++j){ const auto& con=C.cons[j]; for(int p=0;p<(int)con.uidx.size();++p){ int v=con.uidx[p]; varEdges[v].push_back({j,p}); } }
+				auto findEdgeIndex = [&](int v, int conIndex)->int{ const auto& edges=varEdges[v]; for(int i=0;i<(int)edges.size();++i){ if(edges[i].conIndex==conIndex) return i; } return -1; };
+				std::vector<std::vector<double>> vToF(C.m), fToV(C.cons.size());
+				for(int v=0; v<C.m; ++v){ vToF[v].assign(varEdges[v].size(), 0.5); }
+				for(size_t j=0;j<C.cons.size();++j){ fToV[j].assign(C.cons[j].uidx.size(), 0.5); }
+				const int BP_MAX_ITERS = 20; const double BP_DAMP = 0.5; const double BP_EPS = 1e-6;
+				for(int it=0; it<BP_MAX_ITERS; ++it){
+					for(int j=0;j<(int)C.cons.size(); ++j){
+						const auto& con = C.cons[j];
+						const int s = (int)con.uidx.size();
+						const int need = con.num - con.knownMines;
+						for(int p=0; p<s; ++p){
+							std::vector<long double> dp(s, 0.0L); dp[0]=1.0L;
+							for(int q=0; q<s; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=findEdgeIndex(vv,j); double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
+								std::vector<long double> ndp(s, 0.0L);
+								for(int k=0;k<s-1;++k){ if(dp[k]==0.0L) continue; ndp[k] += dp[k]*(1.0L-(long double)prob); ndp[k+1]+=dp[k]*(long double)prob; }
+								dp.swap(ndp);
+							}
+							long double A=0.0L,B=0.0L; if(need-1>=0 && need-1<=s-1) A=dp[need-1]; if(need>=0 && need<=s-1) B=dp[need];
+							double msg=0.5; if(A==0.0L && B==0.0L) msg=0.5; else if(A==0.0L) msg=0.0; else if(B==0.0L) msg=1.0; else { double a=(double)A,b=(double)B; msg=a/(a+b);} 
+							msg = BP_DAMP * fToV[j][p] + (1.0 - BP_DAMP) * std::min(1.0-1e-9, std::max(1e-9, msg));
+							fToV[j][p] = msg;
+						}
+					}
+					for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); if(deg==0) continue; std::vector<double> pref1(deg+1,1.0),pref0(deg+1,1.0); for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; pref1[i+1]=pref1[i]*m1; pref0[i+1]=pref0[i]*(1.0-m1);} std::vector<double> suf1(deg+1,1.0),suf0(deg+1,1.0); for(int i=deg-1;i>=0;--i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; suf1[i]=suf1[i+1]*m1; suf0[i]=suf0[i+1]*(1.0-m1);} for(int i=0;i<deg;++i){ double p1=pref1[i]*suf1[i+1]; double p0=pref0[i]*suf0[i+1]; double msg=(p1==0.0 && p0==0.0)?0.5:(p1/(p1+p0)); msg=std::min(1.0-BP_EPS, std::max(BP_EPS, msg)); vToF[v][i] = BP_DAMP * vToF[v][i] + (1.0 - BP_DAMP) * msg; } }
+				}
+				R.beliefs.assign(C.m, 0.5);
+				for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); double prod1=1.0,prod0=1.0; for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; prod1*=m1; prod0*=(1.0-m1);} double p = (prod1==0.0&&prod0==0.0)?0.5:(prod1/(prod1+prod0)); p=std::min(1.0-BP_EPS, std::max(BP_EPS, p)); R.beliefs[v]=p; }
+			}
 
             // optional SAT forcedness for non-enumerated components
             if(C.m>0 && (int)C.cons.size()>0 && !R.enumerated){
@@ -394,14 +412,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         // apply forced marks from SAT and enumerated 0/1 certainty
         bool anyForced=false;
-        for(int cid=0; cid<compCount; ++cid){
-            const auto& C = comps[cid];
-            const auto& R = compResults[cid];
-            for(int g : R.forcedSafe){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Safe){ ov.marks[g]=Mark::Safe; anyForced=true; enqueueNbrNumbers(g);} } }
-            for(int g : R.forcedMine){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Mine){ ov.marks[g]=Mark::Mine; anyForced=true; enqueueNbrNumbers(g);} } }
-            if(R.enumerated && totalMines==0 && !R.beliefs.empty()){
-                for(int t=0;t<C.m;++t){ int g=C.U[t]; double p=R.beliefs[t]; ov.mineProbability[g]=p; if(t<(int)R.probCertainBits.size() && R.probCertainBits[t]) probCertain[g]=1; }
-            }
+		for(int cid=0; cid<compCount; ++cid){
+			const auto& C = comps[cid];
+			const auto& R = compResults[cid];
+			for(int g : R.forcedSafe){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Safe){ ov.marks[g]=Mark::Safe; ov.hasGuaranteedSafe = true; anyForced=true; enqueueNbrNumbers(g);} } }
+			for(int g : R.forcedMine){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Mine){ ov.marks[g]=Mark::Mine; anyForced=true; enqueueNbrNumbers(g);} } }
         }
         if(anyForced){
             while(!queue.empty()){
@@ -410,8 +425,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 int knownMines2 = 0; int unknownIdx2[8]; int ucount2 = 0;
                 for(int k=0;k<neighborCounts[idxCenter];++k){ int nb2=neighbors[idxCenter][k]; CellState s2=cells[nb2]; if(s2==CellState::Mine || ov.marks[nb2]==Mark::Mine){ knownMines2++; continue; } if(s2==CellState::Unknown && ov.marks[nb2]!=Mark::Safe){ unknownIdx2[ucount2++]=nb2; } }
                 int remaining2 = num2 - knownMines2; if(remaining2 < 0 || remaining2 > ucount2) continue;
-                if(remaining2 == 0 && ucount2 > 0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} } }
-                else if(remaining2 == ucount2 && ucount2>0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Mine){ ov.marks[u]=Mark::Mine; enqueueNbrNumbers(u);} } }
+			if(remaining2 == 0 && ucount2 > 0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; ov.hasGuaranteedSafe = true; enqueueNbrNumbers(u);} } }
+			else if(remaining2 == ucount2 && ucount2>0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Mine){ ov.marks[u]=Mark::Mine; enqueueNbrNumbers(u);} } }
             }
         }
 
@@ -427,191 +442,21 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             }
         }
 
-        const int BP_MAX_ITERS = 20;
-        const double BP_DAMP = 0.5;
-        const double BP_EPS = 1e-6;
-        for(int cid=0; cid<compCount; ++cid){
-            auto& C = comps[cid];
-            if(C.m==0 || (int)C.cons.size()==0) continue;
-            if(C.enumerated) continue;
+		for(int cid=0; cid<compCount; ++cid){
+			const auto& C = comps[cid];
+			const auto& R = compResults[cid];
+			if(C.m==0 || R.beliefs.empty()) continue;
+			for(int t=0; t<C.m; ++t){
+				int g = C.U[t];
+				if(g>=0 && g<N){
+					ov.mineProbability[g] = R.beliefs[t];
+					if(t < (int)R.probCertainBits.size() && R.probCertainBits[t]) probCertain[g] = 1;
+				}
+			}
+		}
 
-            // build variable-to-constraint adjacency
-            struct EdgeRef { int conIndex; int posInCon; };
-            std::vector<std::vector<EdgeRef>> varEdges(C.m);
-            for(int j=0;j<(int)C.cons.size();++j){
-                const auto& con = C.cons[j];
-                for(int p=0;p<(int)con.uidx.size();++p){ int v=con.uidx[p]; varEdges[v].push_back({j,p}); }
-            }
-            auto findEdgeIndex = [&](int v, int conIndex)->int{
-                const auto& edges = varEdges[v];
-                for(int i=0;i<(int)edges.size();++i){ if(edges[i].conIndex==conIndex) return i; }
-                return -1;
-            };
-
-            std::vector<std::vector<double>> vToF(C.m);
-            for(int v=0; v<C.m; ++v){
-                vToF[v].assign(varEdges[v].size(), 0.5);
-                double prior = 0.5;
-                int g = C.U[v];
-                if(g>=0 && g<(int)ov.mineProbability.size() && ov.mineProbability[g] >= 0.0) prior = std::min(1.0-1e-6, std::max(1e-6, ov.mineProbability[g]));
-                for(double& x : vToF[v]) x = prior;
-            }
-            std::vector<std::vector<double>> fToV(C.cons.size());
-            for(size_t j=0;j<C.cons.size();++j){ fToV[j].assign(C.cons[j].uidx.size(), 0.5); }
-
-            for(int it=0; it<BP_MAX_ITERS; ++it){
-                for(int j=0;j<(int)C.cons.size(); ++j){
-                    const auto& con = C.cons[j];
-                    const int s = (int)con.uidx.size();
-                    const int need = con.num - con.knownMines;
-                    for(int p=0; p<s; ++p){
-                        std::vector<long double> dp(s, 0.0L);
-                        dp[0] = 1.0L;
-                        for(int q=0; q<s; ++q){ if(q==p) continue; int vv = con.uidx[q]; int eidx = findEdgeIndex(vv, j); double prob = 0.5; if(eidx>=0) prob = vToF[vv][eidx];
-                            std::vector<long double> ndp(s, 0.0L);
-                            for(int k=0;k<s-1;++k){ if(dp[k]==0.0L) continue; ndp[k] += dp[k] * (1.0L - (long double)prob); ndp[k+1] += dp[k] * (long double)prob; }
-                            dp.swap(ndp);
-                        }
-                        long double A = 0.0L, B = 0.0L;
-                        if(need-1 >= 0 && need-1 <= s-1) A = dp[need-1];
-                        if(need >= 0 && need <= s-1) B = dp[need];
-                        double msg = 0.5;
-                        if(A==0.0L && B==0.0L){ msg = 0.5; }
-                        else if(A==0.0L){ msg = 0.0; }
-                        else if(B==0.0L){ msg = 1.0; }
-                        else { double a=(double)A, b=(double)B; msg = a / (a + b); }
-                        msg = BP_DAMP * fToV[j][p] + (1.0 - BP_DAMP) * std::min(1.0-1e-9, std::max(1e-9, msg));
-                        fToV[j][p] = msg;
-                    }
-                }
-
-                for(int v=0; v<C.m; ++v){
-                    int deg = (int)varEdges[v].size();
-                    if(deg==0) continue;
-                    std::vector<double> pref1(deg+1, 1.0), pref0(deg+1, 1.0);
-                    for(int i=0;i<deg;++i){ const auto& e = varEdges[v][i]; double m1 = fToV[e.conIndex][e.posInCon]; pref1[i+1] = pref1[i]*m1; pref0[i+1] = pref0[i]*(1.0 - m1); }
-                    std::vector<double> suf1(deg+1, 1.0), suf0(deg+1, 1.0);
-                    for(int i=deg-1;i>=0;--i){ const auto& e = varEdges[v][i]; double m1 = fToV[e.conIndex][e.posInCon]; suf1[i] = suf1[i+1]*m1; suf0[i] = suf0[i+1]*(1.0 - m1); }
-                    for(int i=0;i<deg;++i){
-                        double p1 = pref1[i]*suf1[i+1];
-                        double p0 = pref0[i]*suf0[i+1];
-                        double msg = 0.5;
-                        if(p1==0.0 && p0==0.0) msg = 0.5; else msg = p1 / (p1 + p0);
-                        msg = std::min(1.0-BP_EPS, std::max(BP_EPS, msg));
-                        vToF[v][i] = BP_DAMP * vToF[v][i] + (1.0 - BP_DAMP) * msg;
-                    }
-                }
-            }
-
-            // compute final beliefs per variable
-            for(int v=0; v<C.m; ++v){
-                int deg = (int)varEdges[v].size();
-                double prod1=1.0, prod0=1.0;
-                for(int i=0;i<deg;++i){ const auto& e = varEdges[v][i]; double m1 = fToV[e.conIndex][e.posInCon]; prod1 *= m1; prod0 *= (1.0 - m1); }
-                double p = 0.5; if(!(prod1==0.0 && prod0==0.0)) p = prod1 / (prod1 + prod0);
-                p = std::min(1.0-BP_EPS, std::max(BP_EPS, p));
-                int g = C.U[v]; if(g>=0 && g<(int)ov.mineProbability.size()) ov.mineProbability[g] = p;
-            }
-        }
-
-        // sat-style forcedness check for non-enumerated components to identify guaranteed Safe/Mine
-        {
-            bool anyForced = false;
-            for(int cid=0; cid<compCount; ++cid){
-                auto& C = comps[cid];
-                if(C.m==0 || (int)C.cons.size()==0) continue;
-                if(C.enumerated) continue;
-
-                // degree-ordered variables for stronger pruning
-                std::vector<int> degree(C.m, 0);
-                for(const auto& con : C.cons){ for(int ui : con.uidx){ if(ui>=0 && ui<C.m) degree[ui]++; } }
-                std::vector<int> order(C.m); for(int i=0;i<C.m;++i) order[i]=i;
-                std::sort(order.begin(), order.end(), [&](int a, int b){ if(degree[a]!=degree[b]) return degree[a]>degree[b]; return a<b; });
-
-                // base assignment from already deduced marks
-                std::vector<uint8_t> baseAssign(C.m, 255);
-                for(int t=0;t<C.m;++t){
-                    int g = C.U[t];
-                    if(g>=0 && g<N){
-                        if(ov.marks[g]==Mark::Mine) baseAssign[t]=1;
-                        else if(ov.marks[g]==Mark::Safe) baseAssign[t]=0;
-                    }
-                }
-
-                size_t nodeBudget = 500000; // guard against pathological blowups
-                std::function<bool(std::vector<uint8_t>&, int, size_t&)> dfsSat = [&](std::vector<uint8_t>& assign, int idx, size_t& budget)->bool{
-                    if(budget==0) return false;
-                    // local feasibility pruning
-                    for(const auto& con : C.cons){
-                        int need = con.num - con.knownMines;
-                        int placed=0, unk=0;
-                        for(int ui : con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
-                        if(need < placed) return false;
-                        if(need > placed + unk) return false;
-                    }
-                    if(idx==C.m) return true;
-                    int var = order[idx];
-                    if(assign[var] != 255){
-                        return dfsSat(assign, idx+1, budget);
-                    }
-                    assign[var]=0; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
-                    assign[var]=255;
-                    assign[var]=1; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
-                    assign[var]=255;
-                    return false;
-                };
-
-                auto isForced = [&](int varIdx)->int{ // -1 not forced, 0 forced safe, 1 forced mine
-                    if(baseAssign[varIdx]==0) return 0;
-                    if(baseAssign[varIdx]==1) return 1;
-                    std::vector<uint8_t> a0 = baseAssign; a0[varIdx]=0; size_t b0=nodeBudget;
-                    bool sat0 = dfsSat(a0, 0, b0);
-                    std::vector<uint8_t> a1 = baseAssign; a1[varIdx]=1; size_t b1=nodeBudget;
-                    bool sat1 = dfsSat(a1, 0, b1);
-                    if(sat0 && !sat1) return 0;
-                    if(!sat0 && sat1) return 1;
-                    return -1;
-                };
-
-                for(int t=0;t<C.m;++t){
-                    int forced = isForced(t);
-                    if(forced==0){
-                        int g = C.U[t]; if(ov.marks[g] != Mark::Safe){ ov.marks[g]=Mark::Safe; ov.hasGuaranteedSafe=true; enqueueNbrNumbers(g); anyForced=true; }
-                    } else if(forced==1){
-                        int g = C.U[t]; if(ov.marks[g] != Mark::Mine){ ov.marks[g] = Mark::Mine; enqueueNbrNumbers(g); anyForced=true; }
-                    }
-                }
-            }
-
-            // propagate around newly forced marks immediately
-            if(anyForced){
-                while(!queue.empty()){
-                    int idxCenter = queue.back(); queue.pop_back(); inQueue[idxCenter]=0;
-                    int y2 = idxCenter / w; (void)y2; int x2 = idxCenter % w; (void)x2;
-                    int num2 = numbers[idxCenter];
-                    if(num2 < 0) continue;
-                    int knownMines2 = 0;
-                    int unknownIdx2[8]; int ucount2 = 0;
-                    for(int k=0;k<neighborCounts[idxCenter];++k){
-                        int nb2 = neighbors[idxCenter][k];
-                        CellState s2 = cells[nb2];
-                        // only count preexisting flags or deduced mines here; do not treat FlagForChord as flagged
-                        if(s2 == CellState::Mine || ov.marks[nb2] == Mark::Mine){ knownMines2++; continue; }
-                        if(s2 == CellState::Unknown && ov.marks[nb2] != Mark::Safe){ unknownIdx2[ucount2++] = nb2; }
-                    }
-                    int remaining2 = num2 - knownMines2;
-                    if(remaining2 < 0 || remaining2 > ucount2){ continue; }
-                    if(remaining2 == 0 && ucount2 > 0){
-                        for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} }
-                    } else if(remaining2 == ucount2 && ucount2>0){
-                        for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] == Mark::FlagForChord){ continue; } if(ov.marks[u] != Mark::Mine){ ov.marks[u] = Mark::Mine; enqueueNbrNumbers(u);} }
-                    }
-                }
-            }
-        }
-
-        bool anyEnumerated=false; for(const auto& C : comps){ if(C.enumerated){ anyEnumerated=true; break; } }
-        if(totalMines>0 && anyEnumerated){
+		bool anyEnumerated=false; for(const auto& C : comps){ if(C.enumerated){ anyEnumerated=true; break; } }
+		if(totalMines>=0 && anyEnumerated){
             int knownGlobal=0, unknownGlobal=0; for(int i=0;i<N;++i){ if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) knownGlobal++; else if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Safe) unknownGlobal++; }
             int unknownInEnum=0; for(const auto& C : comps){ if(C.enumerated) unknownInEnum += C.m; }
             int freeUnknown = std::max(0, unknownGlobal - unknownInEnum);
@@ -665,8 +510,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             }
         }
 
-        // complete probabilities for all unknown cells if totalMines is known
-        if(totalMines>0){
+		// complete probabilities for all unknown cells if totalMines is known
+		if(totalMines>=0){
             int knownGlobal=0; for(int i=0;i<N;++i){ if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) knownGlobal++; }
             int remainingGlobal = std::max(0, totalMines - knownGlobal);
 
@@ -707,7 +552,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         }
         std::vector<int> changedByProb; changedByProb.reserve(N/8+1);
         if(hasProb && std::isfinite(bestProb)){
-            // only convert to Safe/Mine when probabilities are logically certain (from exact enumeration)
+            // only convert to Safe/Mine when probabilities are logically certain
             for(int i=0;i<N;++i){
                 if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0 && probCertain[i]){
                     if(ov.mineProbability[i] == 0.0){ if(ov.marks[i]!=Mark::Safe){ ov.marks[i]=Mark::Safe; ov.hasGuaranteedSafe = true; changedByProb.push_back(i); } }
@@ -724,7 +569,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 }
             }
 
-    // chord valuation using probabilities and a simple cascade heuristic
+    // chord valuation using probabilities and cascace heuristic
     if(enableChords && ov.mineProbability.size()==(size_t)N){
         // clear prior chord/flag marks while preserving Safe/Mine/Guess
         for(int i=0;i<N;++i){ if(ov.marks[i]==Mark::Chord || ov.marks[i]==Mark::FlagForChord) ov.marks[i]=Mark::None; }

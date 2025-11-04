@@ -27,4 +27,5 @@ and make sure you're compiling for x64, also if u cant use AVX2, use `/arch:SSE2
 
 ---
 
-> 
+>
+

@@ -23,16 +23,18 @@
     origin: { x: 0, y: 0 },
     cellPx: 0,
     lastFullSent: 0,
-    minesTotal: 0,
+    minesTotal: -1,
     captureMode: false,
     captureBuffer: ''
   };
   let lastNoBoardLog = 0;
 
   try {
-    chrome.storage?.local?.get?.({ mines_total: 0 }).then((res) => {
-      const v = Number(res?.mines_total || 0);
-      STATE.minesTotal = Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
+    chrome.storage?.local?.get?.({ mines_total: -1 }).then((res) => {
+      const raw = Number(res?.mines_total);
+      let v = Number.isFinite(raw) ? Math.floor(raw) : -1;
+      if (v < -1) v = -1;
+      STATE.minesTotal = v;
       log('loaded mines_total', STATE.minesTotal);
     });
   } catch {}
@@ -42,10 +44,19 @@
     try {
       const isShiftM = e.shiftKey && (e.key === 'M' || e.key === 'm');
       const commit = () => {
-        const n = STATE.captureBuffer.trim() === '' ? 0 : Math.max(0, Math.floor(Number(STATE.captureBuffer)) || 0);
-        STATE.minesTotal = n;
-        try { chrome.storage?.local?.set?.({ mines_total: n }); } catch {}
-        log('capture mines mode: set', n, 'buffer=', STATE.captureBuffer);
+        const trimmed = STATE.captureBuffer.trim();
+        let next = -1;
+        if (trimmed !== '') {
+          const parsed = Math.floor(Number(trimmed));
+          if (Number.isFinite(parsed) && parsed >= 0) {
+            next = parsed;
+          } else if (Number.isFinite(parsed) && parsed < 0) {
+            next = -1;
+          }
+        }
+        STATE.minesTotal = next;
+        try { chrome.storage?.local?.set?.({ mines_total: next }); } catch {}
+        log('capture mines mode: set', next, 'buffer=', STATE.captureBuffer);
         try {
           const msg = { type: 'delta', updates: [], cell_px: STATE.cellPx, ox: STATE.origin.x, oy: STATE.origin.y, mines_total: n };
           chrome.runtime.sendMessage(msg, () => {});
