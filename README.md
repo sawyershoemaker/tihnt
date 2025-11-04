@@ -2,7 +2,7 @@
   <img src="https://repository-images.githubusercontent.com/1067421994/aa3a03f7-aaf1-4f5c-aab6-59676f1ec9ff" alt="TIHNT repository banner" width="640">
 </p>
 
-# TIHNT
+#
 
 TIHNT or the Tile Information & Hidden Node Toolkit (holy backronym) is a project that serves as an overlay/cheat for https://minesweeper.online. 
 
