@@ -2,6 +2,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cmath>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -75,34 +76,60 @@ int main(){
     net::WebSocketServer server;
     std::mutex mtx;
     std::atomic<bool> dirty{false};
+    std::atomic<bool> geomOnlyDirty{false};
 
     OverlayGeometry geom{};
 
     server.set_on_message([&](const net::WsMessage& msg){
         proto::ParsedMessage parsed; if(!proto::parse_message(msg.text, parsed)) return;
-        std::lock_guard<std::mutex> lock(mtx);
-        if(parsed.type==proto::MsgType::Full){
-            board.apply_full(parsed.full.cells, parsed.full.w, parsed.full.h);
-            int mt = parsed.full.mines_total; if(mt < -1) mt = -1; g_mines_total.store(mt);
-            geom.board_w = parsed.full.w; geom.board_h = parsed.full.h;
-            geom.rect_l = parsed.full.rect_l; geom.rect_t = parsed.full.rect_t; geom.rect_w = parsed.full.rect_w; geom.rect_h = parsed.full.rect_h;
-            geom.vv_x = parsed.full.vv_x; geom.vv_y = parsed.full.vv_y; geom.vv_scale = (parsed.full.vv_scale>0?parsed.full.vv_scale:1.0);
-            geom.dpr = (parsed.full.dpr>0?parsed.full.dpr:1.0);
-        } else if(parsed.type==proto::MsgType::Delta){
-            board.apply_updates(parsed.delta.updates);
-            int mt = parsed.delta.mines_total;
-            if(mt < -1) mt = -1;
-            g_mines_total.store(mt);
-            if(parsed.delta.rect_w>0 && parsed.delta.rect_h>0){
-                geom.rect_l = parsed.delta.rect_l; geom.rect_t = parsed.delta.rect_t; geom.rect_w = parsed.delta.rect_w; geom.rect_h = parsed.delta.rect_h;
-                geom.vv_x = parsed.delta.vv_x; geom.vv_y = parsed.delta.vv_y; geom.vv_scale = (parsed.delta.vv_scale>0?parsed.delta.vv_scale:geom.vv_scale);
-                geom.dpr = (parsed.delta.dpr>0?parsed.delta.dpr:geom.dpr);
+        bool requestSolver = false;
+        bool requestGeometryUpdate = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if(parsed.type==proto::MsgType::Full){
+                board.apply_full(parsed.full.cells, parsed.full.w, parsed.full.h);
+                int mt = parsed.full.mines_total; if(mt < -1) mt = -1; g_mines_total.store(mt);
+                geom.board_w = parsed.full.w; geom.board_h = parsed.full.h;
+                geom.rect_l = parsed.full.rect_l; geom.rect_t = parsed.full.rect_t; geom.rect_w = parsed.full.rect_w; geom.rect_h = parsed.full.rect_h;
+                geom.vv_x = parsed.full.vv_x; geom.vv_y = parsed.full.vv_y; geom.vv_scale = (parsed.full.vv_scale>0?parsed.full.vv_scale:1.0);
+                geom.dpr = (parsed.full.dpr>0?parsed.full.dpr:1.0);
+                requestSolver = true;
+            } else if(parsed.type==proto::MsgType::Delta){
+                const bool hadUpdates = !parsed.delta.updates.empty();
+                OverlayGeometry prevGeom = geom;
+                int prevMines = g_mines_total.load();
+                board.apply_updates(parsed.delta.updates);
+                int mt = parsed.delta.mines_total;
+                if(mt < -1) mt = -1;
+                g_mines_total.store(mt);
+                if(parsed.delta.rect_w>0 && parsed.delta.rect_h>0){
+                    geom.rect_l = parsed.delta.rect_l; geom.rect_t = parsed.delta.rect_t; geom.rect_w = parsed.delta.rect_w; geom.rect_h = parsed.delta.rect_h;
+                    geom.vv_x = parsed.delta.vv_x; geom.vv_y = parsed.delta.vv_y; geom.vv_scale = (parsed.delta.vv_scale>0?parsed.delta.vv_scale:geom.vv_scale);
+                    geom.dpr = (parsed.delta.dpr>0?parsed.delta.dpr:geom.dpr);
+                }
+                auto geomDiffers = [](double a, double b){ return std::abs(a - b) > 1e-6; };
+                bool minesChanged = (mt != prevMines);
+                bool geomChanged = geomDiffers(prevGeom.rect_l, geom.rect_l)
+                    || geomDiffers(prevGeom.rect_t, geom.rect_t)
+                    || geomDiffers(prevGeom.rect_w, geom.rect_w)
+                    || geomDiffers(prevGeom.rect_h, geom.rect_h)
+                    || geomDiffers(prevGeom.vv_x, geom.vv_x)
+                    || geomDiffers(prevGeom.vv_y, geom.vv_y)
+                    || geomDiffers(prevGeom.vv_scale, geom.vv_scale)
+                    || geomDiffers(prevGeom.dpr, geom.dpr);
+                requestSolver = hadUpdates || minesChanged;
+                requestGeometryUpdate = (!requestSolver) && geomChanged;
+            } else if(parsed.type==proto::MsgType::Bind){
+                int pid = parsed.bind.pid;
+                if(pid > 0){ overlay.set_target_pid((uint32_t)pid); }
             }
-        } else if(parsed.type==proto::MsgType::Bind){
-            int pid = parsed.bind.pid;
-            if(pid > 0){ overlay.set_target_pid((uint32_t)pid); }
         }
-        dirty = true;
+        if(requestGeometryUpdate){
+            geomOnlyDirty.store(true);
+        }
+        if(requestSolver){
+            dirty = true;
+        }
     });
 
     if(!server.start(8765)){
@@ -191,6 +218,18 @@ int main(){
 
             lastGeom = gcopy;
             lastMinesTotal = minesTotal;
+            overlay.update(lastMarks, lastGeom, lastMinesTotal);
+            didSomething = true;
+        }
+
+        if(geomOnlyDirty.exchange(false)){
+            OverlayGeometry gcopy;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                gcopy = geom;
+            }
+            lastGeom = gcopy;
+            lastMinesTotal = g_mines_total.load();
             overlay.update(lastMarks, lastGeom, lastMinesTotal);
             didSomething = true;
         }

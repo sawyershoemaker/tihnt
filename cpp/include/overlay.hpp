@@ -54,7 +54,7 @@ private:
 #ifdef _WIN32
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
-    void redraw();
+    void redraw(bool full = true);
     bool ensureSurface(int w, int h);
     HWND findRenderHost();
     void hide();

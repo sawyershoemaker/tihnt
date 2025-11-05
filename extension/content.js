@@ -25,9 +25,104 @@
     lastFullSent: 0,
     minesTotal: -1,
     captureMode: false,
-    captureBuffer: ''
+    captureBuffer: '',
+    rect: { l: 0, t: 0, w: 0, h: 0 },
+    geometryDirty: true
   };
   let lastNoBoardLog = 0;
+
+  const CAPTURE_MIN_MS = 50;
+  let capturePending = false;
+  let lastCaptureStamp = 0;
+  let geomPending = false;
+
+  function scheduleCapture(reason = 'scheduled') {
+    try {
+      if (capturePending) return;
+      capturePending = true;
+      const runner = () => {
+        capturePending = false;
+        const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+        if (now - lastCaptureStamp < CAPTURE_MIN_MS) {
+          const delay = Math.max(0, CAPTURE_MIN_MS - (now - lastCaptureStamp));
+          setTimeout(() => scheduleCapture(reason), delay);
+          return;
+        }
+        lastCaptureStamp = now;
+        tick(reason);
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(runner);
+      } else {
+        setTimeout(runner, 0);
+      }
+    } catch {}
+  }
+
+  function scheduleGeometry(reason = 'geom') {
+    try {
+      if (geomPending) return;
+      geomPending = true;
+      const run = () => {
+        geomPending = false;
+        sendGeometryDelta(reason);
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(run);
+      } else {
+        setTimeout(run, 0);
+      }
+    } catch {}
+  }
+
+  let boardObserver = null;
+  function ensureMutationObserver() {
+    if (boardObserver || typeof MutationObserver !== 'function') return;
+    try {
+      boardObserver = new MutationObserver((mutations) => {
+        let needCapture = false;
+        let geometryTouched = false;
+        for (const mutation of mutations) {
+          if (mutation.type === 'attributes') {
+            const target = mutation.target;
+            const id = target && target.id;
+            if (id && id.startsWith('cell_')) {
+              needCapture = true;
+            }
+          } else if (mutation.type === 'childList') {
+            const inspectList = (nodes) => {
+              for (const node of nodes) {
+                if (node && node.id && node.id.startsWith && node.id.startsWith('cell_')) {
+                  geometryTouched = true;
+                  needCapture = true;
+                  return;
+                }
+                if (node && node.querySelector) {
+                  const inner = node.querySelector('div[id^="cell_"]');
+                  if (inner) {
+                    geometryTouched = true;
+                    needCapture = true;
+                    return;
+                  }
+                }
+              }
+            };
+            if (mutation.addedNodes && mutation.addedNodes.length) inspectList(mutation.addedNodes);
+            if (mutation.removedNodes && mutation.removedNodes.length) inspectList(mutation.removedNodes);
+          }
+          if (needCapture && geometryTouched) break;
+        }
+        if (geometryTouched) STATE.geometryDirty = true;
+        if (needCapture) {
+          scheduleCapture(geometryTouched ? 'mutation:geom' : 'mutation');
+        }
+      });
+      boardObserver.observe(document.body, { attributes: true, attributeFilter: ['class'], subtree: true, childList: true });
+    } catch (e) {
+      boardObserver = null;
+      log('observer error', String(e));
+    }
+  }
 
   try {
     chrome.storage?.local?.get?.({ mines_total: -1 }).then((res) => {
@@ -109,53 +204,95 @@
     } catch {}
   }, true);
 
-  function capture() {
-    // dom structure
-    const cells = Array.from(document.querySelectorAll('div[id^="cell_"].cell'));
-    if (cells.length === 0) return null;
-    let maxX = -1, maxY = -1;
+  const coordRe = /^cell_(\d+)_(\d+)$/;
+  const coordOf = (id) => {
+    const m = coordRe.exec(id);
+    if (!m) return null;
+    return { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
+  };
+
+  function measureGeometryFromSamples(w, h) {
     let minLeft = Infinity, minTop = Infinity, maxRight = -Infinity, maxBottom = -Infinity;
-    let cellPx = 20;
-    const coordOf = (id) => {
-      const m = /^cell_(\d+)_(\d+)$/.exec(id);
-      if (!m) return null;
-      // flip x and y
-      return { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
-    };
-    // first pass: compute extents and origin from bounding rects
-    for (const el of cells) {
-      const id = el.id || '';
-      const c = coordOf(id);
-      if (!c) continue;
-      if (c.x > maxX) maxX = c.x;
-      if (c.y > maxY) maxY = c.y;
+    let cellPx = STATE.cellPx || 0;
+    let seen = false;
+    const samples = [
+      [0, 0],
+      [Math.max(0, w - 1), 0],
+      [0, Math.max(0, h - 1)],
+      [Math.max(0, w - 1), Math.max(0, h - 1)]
+    ];
+    for (const [sx, sy] of samples) {
+      const el = document.getElementById(`cell_${sx}_${sy}`);
+      if (!el) continue;
       const r = el.getBoundingClientRect();
-      if (r.width && r.height) cellPx = Math.round(Math.max(cellPx, Math.max(r.width, r.height)));
+      if (!r) continue;
+      seen = true;
+      if (r.width && r.height) {
+        const size = Math.round(Math.max(r.width, r.height));
+        if (size > cellPx) cellPx = size;
+      }
       if (r.left < minLeft) minLeft = r.left;
       if (r.top < minTop) minTop = r.top;
       if (r.right > maxRight) maxRight = r.right;
       if (r.bottom > maxBottom) maxBottom = r.bottom;
     }
+    if (!seen || !Number.isFinite(minLeft) || !Number.isFinite(minTop) || !Number.isFinite(maxRight) || !Number.isFinite(maxBottom)) {
+      return null;
+    }
+    return {
+      rect: { l: minLeft, t: minTop, w: Math.max(0, maxRight - minLeft), h: Math.max(0, maxBottom - minTop) },
+      cellPx
+    };
+  }
+
+  function measureGeometryFromCells(cells, defaults) {
+    let minLeft = Infinity, minTop = Infinity, maxRight = -Infinity, maxBottom = -Infinity;
+    let cellPx = defaults?.cellPx || 0;
+    for (const el of cells) {
+      const r = el.getBoundingClientRect();
+      if (!r) continue;
+      if (r.width && r.height) {
+        const size = Math.round(Math.max(r.width, r.height));
+        if (size > cellPx) cellPx = size;
+      }
+      if (r.left < minLeft) minLeft = r.left;
+      if (r.top < minTop) minTop = r.top;
+      if (r.right > maxRight) maxRight = r.right;
+      if (r.bottom > maxBottom) maxBottom = r.bottom;
+    }
+    if (!Number.isFinite(minLeft) || !Number.isFinite(minTop) || !Number.isFinite(maxRight) || !Number.isFinite(maxBottom)) {
+      return null;
+    }
+    return {
+      rect: { l: minLeft, t: minTop, w: Math.max(0, maxRight - minLeft), h: Math.max(0, maxBottom - minTop) },
+      cellPx
+    };
+  }
+
+  function capture() {
+    const cells = Array.from(document.querySelectorAll('div[id^="cell_"].cell'));
+    if (cells.length === 0) return null;
+
+    let maxX = -1;
+    let maxY = -1;
+    for (const el of cells) {
+      const c = coordOf(el.id || '');
+      if (!c) continue;
+      if (c.x > maxX) maxX = c.x;
+      if (c.y > maxY) maxY = c.y;
+    }
     const w = maxX + 1;
     const h = maxY + 1;
     if (w <= 0 || h <= 0) return null;
-    // geometry using css and visual viewport
-    const vv = window.visualViewport;
-    const rect = { l: minLeft, t: minTop, w: Math.max(0, maxRight - minLeft), h: Math.max(0, maxBottom - minTop) };
-    const vv_x = vv ? vv.offsetLeft : window.scrollX;
-    const vv_y = vv ? vv.offsetTop : window.scrollY;
-    const vv_scale = vv ? vv.scale : 1;
-    const origin = { x: 0, y: 0 }; // legacy, unused when rect/vv present
 
-    const states = new Array(w*h).fill(0);
+    const states = new Array(w * h).fill(0);
     let bombDetected = false;
     const normType = (cls) => {
       const m = /^[a-z]+_type(\d+)$/.exec(cls);
       return m ? parseInt(m[1], 10) : null;
     };
     for (const el of cells) {
-      const id = el.id || '';
-      const c = coordOf(id);
+      const c = coordOf(el.id || '');
       if (!c) continue;
       const idx = c.y * w + c.x;
       const classes = (el.className || '').split(/\s+/);
@@ -169,14 +306,36 @@
       if (opened) {
         if (tnum === 10) { bombDetected = true; }
         else if (tnum !== null && tnum >= 0 && tnum <= 8) { states[idx] = 10 + tnum; }
-        else { states[idx] = 10; } // opened zero as fallback
+        else { states[idx] = 10; }
       } else if (closed) {
-        // represent flagged cells as state=2 (game::CellState::Mine) so backend knows flags already exist
         states[idx] = hasFlag ? 2 : 0;
       }
     }
-    const snap = { w, h, states, origin, cellPx, bombDetected, rect, vv: { x: vv_x, y: vv_y, scale: vv_scale } };
-    log('capture', { w, h, cellPx, bombDetected, cellCount: cells.length });
+
+    let rect = STATE.rect;
+    let cellPx = STATE.cellPx || 20;
+    if (STATE.geometryDirty || !rect || rect.w === 0 || rect.h === 0) {
+      const sample = measureGeometryFromSamples(w, h);
+      const geom = sample || measureGeometryFromCells(cells, { cellPx });
+      if (geom) {
+        rect = geom.rect;
+        cellPx = geom.cellPx;
+        STATE.rect = rect;
+        STATE.cellPx = cellPx;
+        STATE.geometryDirty = false;
+      }
+    }
+
+    const vv = window.visualViewport;
+    const vv_x = vv ? vv.offsetLeft : window.scrollX;
+    const vv_y = vv ? vv.offsetTop : window.scrollY;
+    const vv_scale = vv ? vv.scale : 1;
+    const origin = { x: 0, y: 0 };
+
+    const snap = { w, h, states, origin, cellPx, bombDetected, rect: rect || { l: 0, t: 0, w: 0, h: 0 }, vv: { x: vv_x, y: vv_y, scale: vv_scale } };
+    if (debug) {
+      log('capture', { w, h, cellPx, bombDetected, cellCount: cells.length });
+    }
     return snap;
   }
 
@@ -233,7 +392,7 @@
     }
   }
 
-  function tick() {
+  function tick(trigger = 'timer') {
     try {
       const s = capture();
       if (s) {
@@ -242,10 +401,43 @@
         const now = Date.now();
         if (now - lastNoBoardLog > 3000) {
           lastNoBoardLog = now;
-          log('no board found on page');
+          log('no board found on page', trigger);
         }
       }
     } catch (e) { log('tick error', String(e)); }
+  }
+
+  function sendGeometryDelta(reason = 'geom') {
+    try {
+      if (STATE.w <= 0 || STATE.h <= 0) {
+        scheduleCapture(`${reason}:warmup`);
+        return;
+      }
+      const measurement = measureGeometryFromSamples(STATE.w, STATE.h);
+      if (!measurement) {
+        STATE.geometryDirty = true;
+        scheduleCapture(`${reason}:fallback`);
+        return;
+      }
+      const rect = measurement.rect;
+      const measuredCellPx = measurement.cellPx || STATE.cellPx || 0;
+      if (!rect || rect.w === 0 || rect.h === 0 || measuredCellPx <= 0) {
+        STATE.geometryDirty = true;
+        scheduleCapture(`${reason}:invalid`);
+        return;
+      }
+      STATE.rect = rect;
+      STATE.cellPx = measuredCellPx;
+      STATE.geometryDirty = false;
+      const vv = window.visualViewport;
+      const msg = { type: 'delta', updates: [], cell_px: STATE.cellPx, ox: STATE.origin.x, oy: STATE.origin.y, mines_total: STATE.minesTotal,
+        rect_l: rect.l, rect_t: rect.t, rect_w: rect.w, rect_h: rect.h,
+        vv_x: vv ? vv.offsetLeft : window.scrollX, vv_y: vv ? vv.offsetTop : window.scrollY, vv_scale: vv ? vv.scale : 1, dpr: window.devicePixelRatio || 1 };
+      if (debug) log('geom delta', { reason, rect, cellPx: STATE.cellPx });
+      chrome.runtime.sendMessage(msg, () => {});
+    } catch (e) {
+      log('sendGeometryDelta error', String(e));
+    }
   }
 
   // respond to background "force_full" command
@@ -253,6 +445,7 @@
     chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       try {
         if (msg && msg.type === 'force_full') {
+          STATE.geometryDirty = true;
           const s = capture();
           if (!s) { respond && respond({ ok: false }); return; }
           // Always send full regardless of timer/size change
@@ -271,43 +464,24 @@
     });
   } catch {}
 
-  setInterval(tick, 200);
+  ensureMutationObserver();
+  scheduleCapture('init');
+  setInterval(() => scheduleCapture('fallback'), 1000);
+
   const vv = window.visualViewport;
   if (vv) {
-    const onGeom = () => {
-      try {
-        const s = capture();
-        if (!s) return;
-        const msg = { type: 'delta', updates: [], cell_px: s.cellPx, ox: s.origin.x, oy: s.origin.y, mines_total: STATE.minesTotal,
-          rect_l: s.rect.l, rect_t: s.rect.t, rect_w: s.rect.w, rect_h: s.rect.h,
-          vv_x: s.vv.x, vv_y: s.vv.y, vv_scale: s.vv.scale, dpr: window.devicePixelRatio || 1 };
-        chrome.runtime.sendMessage(msg, () => {});
-      } catch {}
-    };
-    vv.addEventListener('scroll', onGeom);
-    vv.addEventListener('resize', onGeom);
-    vv.addEventListener('zoom', onGeom);
-    window.addEventListener('wheel', () => {
-      try { requestAnimationFrame(onGeom); } catch {}
-    }, { passive: true });
-    document.addEventListener('scroll', () => { try { requestAnimationFrame(onGeom); } catch {} }, { passive: true, capture: true });
-    window.addEventListener('scroll', () => { try { requestAnimationFrame(onGeom); } catch {} }, { passive: true });
-    // fallback periodic geometry refresh in case events are throttled
-    setInterval(onGeom, 250);
-  } else {
-    const onGeom = () => {
-      try {
-        const s = capture();
-        if (!s) return;
-        const msg = { type: 'delta', updates: [], cell_px: s.cellPx, ox: s.origin.x, oy: s.origin.y, mines_total: STATE.minesTotal,
-          rect_l: s.rect.l, rect_t: s.rect.t, rect_w: s.rect.w, rect_h: s.rect.h,
-          vv_x: s.vv.x, vv_y: s.vv.y, vv_scale: s.vv.scale, dpr: window.devicePixelRatio || 1 };
-        chrome.runtime.sendMessage(msg, () => {});
-      } catch {}
-    };
-    window.addEventListener('scroll', onGeom, { passive: true });
-    window.addEventListener('resize', onGeom);
+    vv.addEventListener('scroll', () => { STATE.geometryDirty = true; scheduleGeometry('vv:scroll'); });
+    vv.addEventListener('resize', () => { STATE.geometryDirty = true; scheduleGeometry('vv:resize'); });
+    if (typeof vv.addEventListener === 'function') {
+      vv.addEventListener('zoom', () => { STATE.geometryDirty = true; scheduleGeometry('vv:zoom'); });
+    }
   }
+
+  const handleScroll = (reason) => () => { STATE.geometryDirty = true; scheduleGeometry(reason); };
+  window.addEventListener('wheel', () => { STATE.geometryDirty = true; scheduleGeometry('wheel'); }, { passive: true });
+  document.addEventListener('scroll', handleScroll('doc-scroll'), { passive: true, capture: true });
+  window.addEventListener('scroll', handleScroll('win-scroll'), { passive: true });
+  window.addEventListener('resize', handleScroll('resize'));
 })();
 
 

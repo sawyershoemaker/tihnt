@@ -63,10 +63,28 @@ void OverlayWindow::destroy(){
 }
 
 void OverlayWindow::update(const std::vector<solve::Mark>& marks, const OverlayGeometry& geom, int minesTotal){
+    const double kGeomEps = 1e-3;
+    auto diff = [&](double a, double b){ return std::abs(a - b) > kGeomEps; };
+    bool marksChanged = marks != marks_;
+    bool minesChanged = (minesTotal != mines_total_);
+    bool sizeChanged = (geom.board_w != geom_.board_w) || (geom.board_h != geom_.board_h)
+        || diff(geom.rect_w, geom_.rect_w) || diff(geom.rect_h, geom_.rect_h)
+        || diff(geom.dpr, geom_.dpr);
+    bool positionChanged = diff(geom.rect_l, geom_.rect_l) || diff(geom.rect_t, geom_.rect_t);
+
+    if(!marksChanged && !minesChanged && !sizeChanged && !positionChanged){
+        return;
+    }
+
     marks_ = marks;
     geom_ = geom;
     mines_total_ = minesTotal;
-    redraw();
+
+    if(!marksChanged && !minesChanged && !sizeChanged && positionChanged){
+        redraw(false);
+    } else {
+        redraw(true);
+    }
 }
 
 void OverlayWindow::tick(){
@@ -166,7 +184,7 @@ void OverlayWindow::show_noactivate(){
     if(hwnd_) ShowWindow(hwnd_, SW_SHOWNA);
 }
 
-void OverlayWindow::redraw(){
+void OverlayWindow::redraw(bool full){
     if(!hwnd_) return;
     const double dpr = (geom_.dpr > 0.0 ? geom_.dpr : 1.0);
     const double scalePx = dpr;
@@ -195,9 +213,6 @@ void OverlayWindow::redraw(){
     if(dstW<=0 || dstH<=0){ dstW = surf_w_; dstH = surf_h_; }
     // clear to fully transparent
     BLENDFUNCTION bf{}; bf.BlendOp=AC_SRC_OVER; bf.SourceConstantAlpha=255; bf.AlphaFormat=AC_SRC_ALPHA;
-    // clear
-    std::memset(bits_, 0, (size_t)(stride_ * dstH));
-
     // pixel writers available to subsequent draw helpers   
     auto putPixel = [&](int px, int py, uint32_t rgba){
         if(px<0||py<0||px>=dstW||py>=dstH) return;
@@ -228,10 +243,13 @@ void OverlayWindow::redraw(){
         *reinterpret_cast<uint32_t*>(p) = bgra;
     };
 
-    // draw overlay marks: green boxes for Safe, red X for Mine, orange box for Guess
-    const int w = geom_.board_w;
-    const int h = geom_.board_h;
-    if(w>0 && h>0 && (int)marks_.size()==w*h){
+    if(full){
+        std::memset(bits_, 0, (size_t)(stride_ * dstH));
+
+        // draw overlay marks: green boxes for Safe, red X for Mine, orange box for Guess
+        const int w = geom_.board_w;
+        const int h = geom_.board_h;
+        if(w>0 && h>0 && (int)marks_.size()==w*h){
         // precompute per-cell pixel edges to avoid repeated rounding in the hot loop
         std::vector<int> x0(w+1), y0(h+1);
         for(int xx=0; xx<=w; ++xx){ x0[xx] = (int)std::round(((double)dstW * (double)xx) / (double)w); }
@@ -402,16 +420,15 @@ void OverlayWindow::redraw(){
     };
     auto drawText = [&](int x, int y, const std::string& s, uint32_t color){ int pen=x; for(char ch : s){ drawChar(pen,y,ch,color); pen += 6; } };
     // always draw M= text even if board dims are zero-sized surface; guard for tiny overlays
-    if(dstW>=20 && dstH>=10){
-        std::string label = "M=" + std::to_string(std::max(0, mines_total_));
-        drawText(2, 2, label, 0xFFFFFFFF); // white
-        if(!excluded_from_capture_){
-            // when overlay is visible to recording, add a status line
-            drawText(2, 12, std::string("VISIBLE"), 0xFFFFFFFF);
-        }
-        if(safety_mode_){
-            // show a small SAFE tag in the corner when safety mode is active
-            drawText(2, 22, std::string("SAFE"), 0xFF00FF00);
+        if(dstW>=20 && dstH>=10){
+            std::string label = "M=" + std::to_string(std::max(0, mines_total_));
+            drawText(2, 2, label, 0xFFFFFFFF);
+            if(!excluded_from_capture_){
+                drawText(2, 12, std::string("VISIBLE"), 0xFFFFFFFF);
+            }
+            if(safety_mode_){
+                drawText(2, 22, std::string("SAFE"), 0xFF00FF00);
+            }
         }
     }
 

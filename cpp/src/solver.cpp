@@ -7,7 +7,109 @@
 #include <limits>
 #include <unordered_map>
 #include <thread>
+#include <random>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+
+namespace {
+
+class WorkerPool {
+public:
+    static WorkerPool& instance(){
+        static WorkerPool pool;
+        return pool;
+    }
+
+    void run(int threadsRequested, int taskCount, const std::function<void(int)>& fn){
+        if(taskCount <= 0){ return; }
+        if(threadsRequested <= 0){ threadsRequested = 1; }
+        ensure_threads(threadsRequested);
+        int maxThreads = static_cast<int>(workers_.size());
+        int active = std::min({std::max(1, threadsRequested), maxThreads, taskCount});
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            currentTask_ = fn;
+            taskCount_ = taskCount;
+            activeThreads_ = active;
+            nextTask_.store(0, std::memory_order_relaxed);
+            workersDone_.store(0, std::memory_order_relaxed);
+            hasWork_ = true;
+        }
+        cv_.notify_all();
+        std::unique_lock<std::mutex> lock(mtx_);
+        doneCv_.wait(lock, [&]{ return !hasWork_; });
+    }
+
+private:
+    WorkerPool() = default;
+    ~WorkerPool(){
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopping_ = true;
+            hasWork_ = false;
+        }
+        cv_.notify_all();
+        doneCv_.notify_all();
+        for(auto& th : workers_){ if(th.joinable()) th.join(); }
+    }
+
+    void ensure_threads(int threadsRequested){
+        int needed = std::max(1, threadsRequested);
+        while(static_cast<int>(workers_.size()) < needed){
+            int index = static_cast<int>(workers_.size());
+            workers_.emplace_back([this, index](){ worker_loop(index); });
+        }
+    }
+
+    void worker_loop(int index){
+        for(;;){
+            std::unique_lock<std::mutex> lock(mtx_);
+            cv_.wait(lock, [&]{ return stopping_ || hasWork_; });
+            if(stopping_) return;
+            if(!hasWork_){
+                continue;
+            }
+            if(index >= activeThreads_){
+                doneCv_.wait(lock, [&]{ return stopping_ || !hasWork_; });
+                if(stopping_) return;
+                continue;
+            }
+            auto task = currentTask_;
+            int taskCount = taskCount_;
+            int participants = activeThreads_;
+            lock.unlock();
+            for(;;){
+                int cid = nextTask_.fetch_add(1, std::memory_order_relaxed);
+                if(cid >= taskCount) break;
+                task(cid);
+            }
+            if(workersDone_.fetch_add(1, std::memory_order_acq_rel) + 1 == participants){
+                std::lock_guard<std::mutex> guard(mtx_);
+                hasWork_ = false;
+                doneCv_.notify_all();
+            } else {
+                std::unique_lock<std::mutex> waitLock(mtx_);
+                doneCv_.wait(waitLock, [&]{ return stopping_ || !hasWork_; });
+                if(stopping_) return;
+            }
+        }
+    }
+
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::condition_variable doneCv_;
+    std::vector<std::thread> workers_;
+    std::function<void(int)> currentTask_;
+    std::atomic<int> nextTask_{0};
+    std::atomic<int> workersDone_{0};
+    int taskCount_ = 0;
+    int activeThreads_ = 0;
+    bool hasWork_ = false;
+    bool stopping_ = false;
+};
+
+}
 
 namespace solve {
 
@@ -24,6 +126,8 @@ static inline int cell_number(CellState s){
 	if(si >= base && si <= base + 8){ return si - base; }
 	return -1;
 }
+
+static thread_local std::mt19937 rng(std::random_device{}());
 
 Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, int threads){
 	constexpr int UNKNOWN_TOTAL = -1;
@@ -282,7 +386,10 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
             // degree order once
             std::vector<int> degree(C.m, 0);
-            for(const auto& con : C.cons){ for(int ui : con.uidx){ if(ui>=0 && ui<C.m) degree[ui]++; } }
+            std::vector<std::vector<int>> varToCons(C.m);
+            for(size_t ci=0; ci<C.cons.size(); ++ci){ const auto& con = C.cons[ci];
+                for(int ui : con.uidx){ if(ui>=0 && ui<C.m){ degree[ui]++; varToCons[ui].push_back((int)ci); } }
+            }
             std::vector<int> order(C.m); for(int i=0;i<C.m;++i) order[i]=i;
             std::sort(order.begin(), order.end(), [&](int a, int b){ if(degree[a]!=degree[b]) return degree[a]>degree[b]; return a<b; });
 
@@ -337,7 +444,86 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					R.probCertainBits.clear();
 				}
 			}
-			if(needApprox){
+
+		if(needApprox){
+			const int MC_MAX_VARS = 64;
+			const int MC_MAX_SAMPLES = 768;
+			const int MC_MIN_VALID = 64;
+			const int MC_MAX_ATTEMPTS = MC_MAX_SAMPLES * 4;
+			const size_t MC_NODE_BUDGET = 200000;
+			if(C.m <= MC_MAX_VARS){
+				std::vector<int> sampleOrder = order;
+				std::vector<uint8_t> assignMC(C.m, 255);
+				std::vector<int> mineHits(C.m, 0);
+				int samples = 0;
+				int attempts = 0;
+				bool unsatDetected = false;
+				bool budgetExceeded = false;
+				auto constraint_ok = [&](int conIdx)->bool{
+					const auto& con = C.cons[conIdx];
+					int need = con.num - con.knownMines;
+					int placed = 0, unk = 0;
+					for(int ui : con.uidx){ uint8_t v = assignMC[ui]; if(v==1) placed++; else if(v==255) unk++; }
+					return !(need < placed || need > placed + unk);
+				};
+				auto consistent_after = [&](int varIdx)->bool{
+					for(int conIdx : varToCons[varIdx]){ if(!constraint_ok(conIdx)) return false; }
+					return true;
+				};
+				std::uniform_int_distribution<int> dist01(0,1);
+				std::function<bool(int,size_t&)> dfsSample = [&](int depth, size_t& budget)->bool{
+					if(depth == C.m) return true;
+					if(budget == 0){ budgetExceeded = true; return false; }
+					--budget;
+					int var = sampleOrder[depth];
+					std::array<int,2> choices{}; int choiceCount = 0;
+					for(int val=0; val<=1; ++val){
+						assignMC[var] = static_cast<uint8_t>(val);
+						if(consistent_after(var)) choices[choiceCount++] = val;
+					}
+					assignMC[var] = 255;
+					if(choiceCount == 0) return false;
+					if(choiceCount == 2 && dist01(rng)) std::swap(choices[0], choices[1]);
+					for(int i=0;i<choiceCount;++i){
+						assignMC[var] = static_cast<uint8_t>(choices[i]);
+						if(dfsSample(depth+1, budget)) return true;
+					}
+					assignMC[var] = 255;
+					return false;
+				};
+				while(samples < MC_MAX_SAMPLES && attempts < MC_MAX_ATTEMPTS && !budgetExceeded){
+					attempts++;
+					std::fill(assignMC.begin(), assignMC.end(), 255);
+					std::shuffle(sampleOrder.begin(), sampleOrder.end(), rng);
+					size_t budget = MC_NODE_BUDGET;
+					if(dfsSample(0, budget)){
+						samples++;
+						for(int i=0;i<C.m;++i){ if(assignMC[i]==1) mineHits[i]++; }
+					} else {
+						if(!budgetExceeded) unsatDetected = true;
+						break;
+					}
+				}
+				if(samples >= MC_MIN_VALID){
+					R.beliefs.assign(C.m, 0.5);
+					R.probCertainBits.assign(C.m, 0);
+					for(int i=0;i<C.m;++i){
+						double p = (double)mineHits[i] / (double)samples;
+						if(p < 1e-12) p = 0.0;
+						else if(p > 1.0 - 1e-12) p = 1.0;
+						R.beliefs[i] = p;
+						if(p == 0.0 || p == 1.0) R.probCertainBits[i] = 1;
+					}
+					needApprox = false;
+				}
+				if(unsatDetected || budgetExceeded){
+					needApprox = true;
+				}
+			} else {
+				needApprox = true;
+			}
+		}
+		if(needApprox){
 				// belief propagation fallback
 				struct EdgeRef { int conIndex; int posInCon; };
 				std::vector<std::vector<EdgeRef>> varEdges(C.m);
@@ -402,12 +588,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         if(threadCount == 1){
             for(int cid=0; cid<compCount; ++cid){ process_component(cid); }
         } else {
-            std::atomic<int> nextCid{0};
-            std::vector<std::thread> ths; ths.reserve(threadCount);
-            for(int t=0;t<threadCount;++t){
-                ths.emplace_back([&](){ for(;;){ int cid = nextCid.fetch_add(1); if(cid>=compCount) break; process_component(cid); } });
-            }
-            for(auto& th : ths) th.join();
+            WorkerPool::instance().run(threadCount, compCount, [&](int cid){ process_component(cid); });
         }
 
         // apply forced marks from SAT and enumerated 0/1 certainty
@@ -546,12 +727,29 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         if(ov.mineProbability.size()==(size_t)N){
             for(int i=0;i<N;++i){ if(ov.mineProbability[i] >= 0.0){ if(ov.mineProbability[i] <= 1e-12) ov.mineProbability[i]=0.0; else if(ov.mineProbability[i] >= 1.0 - 1e-12) ov.mineProbability[i]=1.0; } }
         }
-        bool hasProb=false; double bestProb=std::numeric_limits<double>::infinity();
-        if(ov.mineProbability.size()==(size_t)N){
-            for(int i=0;i<N;++i){ if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){ hasProb=true; if(ov.mineProbability[i] < bestProb) bestProb = ov.mineProbability[i]; } }
-        }
-        std::vector<int> changedByProb; changedByProb.reserve(N/8+1);
-        if(hasProb && std::isfinite(bestProb)){
+		const double kCascadeDampen = 0.5;
+		auto probOf = [&](int idx)->double{
+			double p = 1.0;
+			if(idx>=0 && idx<N){
+				if(cells[idx]==CellState::Unknown){
+					p = ov.mineProbability[idx];
+					if(!(p>=0.0 && p<=1.0)) p = 1.0;
+				} else if(cells[idx]==CellState::Mine || ov.marks[idx]==Mark::Mine){
+					p = 1.0;
+				} else {
+					p = 0.0;
+				}
+			}
+			if(p < 0.0) p = 0.0;
+			if(p > 1.0) p = 1.0;
+			return p;
+		};
+		bool hasProb=false;
+		if(ov.mineProbability.size()==(size_t)N){
+			for(int i=0;i<N;++i){ if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){ hasProb=true; break; } }
+		}
+		std::vector<int> changedByProb; changedByProb.reserve(N/8+1);
+		if(hasProb){
             // only convert to Safe/Mine when probabilities are logically certain
             for(int i=0;i<N;++i){
                 if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0 && probCertain[i]){
@@ -559,39 +757,54 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                     else if(ov.mineProbability[i] == 1.0){ if(ov.marks[i]!=Mark::Mine){ ov.marks[i]=Mark::Mine; changedByProb.push_back(i); } }
                 }
             }
-            // only set Guess when no guaranteed safe exists
-            if(!ov.hasGuaranteedSafe){
-                const double eps = 1e-9;
-                for(int i=0;i<N;++i){
-                    if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Mine && ov.mineProbability[i]>=0.0){
-                        if(std::abs(ov.mineProbability[i] - bestProb) <= eps){ ov.marks[i]=Mark::Guess; }
-                    }
-                }
-            }
+			// only set Guess when no guaranteed safe exists
+			if(!ov.hasGuaranteedSafe){
+				const double eps = 1e-9;
+				double bestScore = -std::numeric_limits<double>::infinity();
+				double bestRisk = 1.0;
+				std::vector<int> bestGuess;
+				bestGuess.reserve(8);
+				for(int i=0;i<N;++i){
+					if(cells[i]!=CellState::Unknown) continue;
+					if(ov.marks[i]==Mark::Mine) continue;
+					double p = probOf(i);
+					if(!(p>=0.0 && p<1.0)) continue;
+					double safeProb = 1.0 - p;
+					if(safeProb < 0.0) safeProb = 0.0;
+					long double zeroProb = 1.0L;
+					int unknownCount = 0;
+					for(int k=0;k<neighborCounts[i];++k){
+						int nb = neighbors[i][k];
+						double pn = probOf(nb);
+						zeroProb *= (1.0 - pn);
+						if(cells[nb]==CellState::Unknown && ov.marks[nb]!=Mark::Mine){ unknownCount++; }
+					}
+					double cascadeBonus = (double)zeroProb * (double)unknownCount * kCascadeDampen * safeProb;
+					double score = safeProb + cascadeBonus;
+					if(score > bestScore + eps){
+						bestScore = score;
+						bestRisk = p;
+						bestGuess.clear();
+						bestGuess.push_back(i);
+					} else if(std::abs(score - bestScore) <= eps){
+						if(p < bestRisk - eps){
+							bestRisk = p;
+							bestGuess.clear();
+							bestGuess.push_back(i);
+						} else if(std::abs(p - bestRisk) <= eps){
+							bestGuess.push_back(i);
+						}
+					}
+				}
+				for(int idxGuess : bestGuess){ ov.marks[idxGuess] = Mark::Guess; }
+			}
 
     // chord valuation using probabilities and cascace heuristic
     if(enableChords && ov.mineProbability.size()==(size_t)N){
         // clear prior chord/flag marks while preserving Safe/Mine/Guess
         for(int i=0;i<N;++i){ if(ov.marks[i]==Mark::Chord || ov.marks[i]==Mark::FlagForChord) ov.marks[i]=Mark::None; }
-
-        auto probOf = [&](int idx)->double{
-            double p = 1.0; // default to risky if unknown
-            if(idx>=0 && idx<N && cells[idx]==CellState::Unknown){
-                p = ov.mineProbability[idx];
-                if(!(p>=0.0 && p<=1.0)) p = 1.0; // clamp invalids to risky
-            } else if(idx>=0 && idx<N && (cells[idx]==CellState::Mine || ov.marks[idx]==Mark::Mine)){
-                p = 1.0;
-            } else {
-                p = 0.0;
-            }
-            if(p<0.0) p=0.0; if(p>1.0) p=1.0;
-            return p;
-        };
-
         auto willFlagForChord = [&](int idx)->bool{ return ov.marks[idx]==Mark::Mine && cells[idx]!=CellState::Mine; };
         const double kProbEps = 1e-9;
-
-        const double kCascadeDampen = 0.5; // dampen cascade bonus to avoid double counting
 
         struct ChordCandidate {
             int centerIdx;
@@ -810,15 +1023,162 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         }
         }
 
-        // if we still have neither safe moves nor probabilities to guide, fall back to a center guess
-        if(!ov.hasGuaranteedSafe){
-            bool anyGuess=false; for(const auto m : ov.marks){ if(m==Mark::Guess){ anyGuess=true; break; } }
-            if(!anyGuess){
-                int cx=w/2, cy=h/2; int bestIdx=-1; int bestDist=std::numeric_limits<int>::max();
-                for(int y=0;y<h;++y){ for(int x=0;x<w;++x){ if(board.at(x,y)==CellState::Unknown){ int dx=x-cx, dy=y-cy; int d=dx*dx+dy*dy; if(d<bestDist){ bestDist=d; bestIdx=to_index(x,y,w);} } } }
-                if(bestIdx>=0) ov.marks[bestIdx]=Mark::Guess;
-            }
-        }
+		// if we still have neither safe moves nor probabilities to guide, fall back to a region-weighted guess
+		if(!ov.hasGuaranteedSafe){
+			bool anyGuess=false; for(const auto m : ov.marks){ if(m==Mark::Guess){ anyGuess=true; break; } }
+			if(!anyGuess){
+				std::vector<uint8_t> visited(N, 0);
+				struct RegionCandidate {
+					std::vector<int> cells;
+					int size = 0;
+					int parityCount[2] = {0,0};
+					bool touchesEdge = false;
+					int minCenterDist = std::numeric_limits<int>::max();
+				};
+				RegionCandidate bestRegion;
+				int cx = w/2;
+				int cy = h/2;
+				auto enqueueNeighbor = [&](int idx, std::vector<int>& stack){ if(!visited[idx]){ visited[idx]=1; stack.push_back(idx); } };
+				const int dx4[4] = {1,-1,0,0};
+				const int dy4[4] = {0,0,1,-1};
+				for(int idx=0; idx<N; ++idx){
+					if(visited[idx]) continue;
+					if(cells[idx] != CellState::Unknown) continue;
+					if(ov.marks[idx] == Mark::Mine) continue;
+					visited[idx] = 1;
+					RegionCandidate region;
+					std::vector<int> stack; stack.push_back(idx);
+					while(!stack.empty()){
+						int cur = stack.back(); stack.pop_back();
+						region.cells.push_back(cur);
+						region.size++;
+						int x = cur % w;
+						int y = cur / w;
+						region.parityCount[(x + y) & 1]++;
+						if(x==0 || x==w-1 || y==0 || y==h-1) region.touchesEdge = true;
+						int dx = x - cx; int dy = y - cy;
+						int centerDist = dx*dx + dy*dy;
+						if(centerDist < region.minCenterDist) region.minCenterDist = centerDist;
+						for(int dir=0; dir<4; ++dir){
+							int nx = x + dx4[dir];
+							int ny = y + dy4[dir];
+							if(!in_bounds(nx, ny, w, h)) continue;
+							int nidx = to_index(nx, ny, w);
+							if(visited[nidx]) continue;
+							if(cells[nidx] != CellState::Unknown) continue;
+							if(ov.marks[nidx] == Mark::Mine) continue;
+							enqueueNeighbor(nidx, stack);
+						}
+					}
+					int majority = std::max(region.parityCount[0], region.parityCount[1]);
+					int bestMajority = std::max(bestRegion.parityCount[0], bestRegion.parityCount[1]);
+					if(region.size > bestRegion.size
+						|| (region.size == bestRegion.size && majority > bestMajority)
+						|| (region.size == bestRegion.size && majority == bestMajority && region.touchesEdge && !bestRegion.touchesEdge)
+						|| (region.size == bestRegion.size && majority == bestMajority && region.touchesEdge == bestRegion.touchesEdge && region.minCenterDist < bestRegion.minCenterDist)){
+						bestRegion = std::move(region);
+					}
+				}
+				if(!bestRegion.cells.empty()){
+					std::vector<uint8_t> inRegion(N, 0);
+					for(int cellIdx : bestRegion.cells) inRegion[cellIdx] = 1;
+					std::vector<int> regionDist(N, -1);
+					std::vector<int> queue;
+					queue.reserve(bestRegion.cells.size());
+					for(int cellIdx : bestRegion.cells){
+						int x = cellIdx % w;
+						int y = cellIdx / w;
+						bool boundary = false;
+						for(int dir=0; dir<4; ++dir){
+							int nx = x + dx4[dir];
+							int ny = y + dy4[dir];
+							if(!in_bounds(nx, ny, w, h) || !inRegion[to_index(nx, ny, w)]){ boundary = true; break; }
+						}
+						if(boundary){
+							regionDist[cellIdx] = 0;
+							queue.push_back(cellIdx);
+						}
+					}
+					for(size_t qi=0; qi<queue.size(); ++qi){
+						int cur = queue[qi];
+						int distCur = regionDist[cur];
+						int x = cur % w;
+						int y = cur / w;
+						for(int dir=0; dir<4; ++dir){
+							int nx = x + dx4[dir];
+							int ny = y + dy4[dir];
+							if(!in_bounds(nx, ny, w, h)) continue;
+							int nidx = to_index(nx, ny, w);
+							if(!inRegion[nidx]) continue;
+							if(regionDist[nidx] != -1) continue;
+							regionDist[nidx] = distCur + 1;
+							queue.push_back(nidx);
+						}
+					}
+					int bestParity = (bestRegion.parityCount[0] >= bestRegion.parityCount[1]) ? 0 : 1;
+					bool preferEdge = bestRegion.touchesEdge;
+					int bestIdx = -1;
+					int bestDepth = -1;
+					bool bestOnEdge = false;
+					int bestCenterScore = std::numeric_limits<int>::max();
+					for(int cellIdx : bestRegion.cells){
+						int x = cellIdx % w;
+						int y = cellIdx / w;
+						int parity = (x + y) & 1;
+						if(parity != bestParity) continue;
+						int depth = regionDist[cellIdx]; if(depth < 0) depth = 0;
+						bool onEdge = (x==0 || x==w-1 || y==0 || y==h-1);
+						int dx = x - cx; int dy = y - cy;
+						int centerDist = dx*dx + dy*dy;
+						bool take = false;
+						if(depth > bestDepth + 0){
+							take = true;
+						} else if(depth == bestDepth){
+							if(preferEdge && onEdge && !bestOnEdge) take = true;
+							else if((!preferEdge || onEdge == bestOnEdge) && centerDist < bestCenterScore) take = true;
+							else if((!preferEdge || onEdge == bestOnEdge) && centerDist == bestCenterScore && cellIdx < bestIdx) take = true;
+						}
+						if(take){
+							bestIdx = cellIdx;
+							bestDepth = depth;
+							bestOnEdge = onEdge;
+							bestCenterScore = centerDist;
+						}
+					}
+					if(bestIdx < 0){
+						bestDepth = -1; bestOnEdge = false; bestCenterScore = std::numeric_limits<int>::max();
+						for(int cellIdx : bestRegion.cells){
+							int x = cellIdx % w;
+							int y = cellIdx / w;
+							int depth = regionDist[cellIdx]; if(depth < 0) depth = 0;
+							bool onEdge = (x==0 || x==w-1 || y==0 || y==h-1);
+							int dx = x - cx; int dy = y - cy;
+							int centerDist = dx*dx + dy*dy;
+							bool take = false;
+							if(depth > bestDepth) take = true;
+							else if(depth == bestDepth){
+								if(preferEdge && onEdge && !bestOnEdge) take = true;
+								else if((!preferEdge || onEdge == bestOnEdge) && centerDist < bestCenterScore) take = true;
+								else if((!preferEdge || onEdge == bestOnEdge) && centerDist == bestCenterScore && cellIdx < bestIdx) take = true;
+							}
+							if(take){
+								bestIdx = cellIdx;
+								bestDepth = depth;
+								bestOnEdge = onEdge;
+								bestCenterScore = centerDist;
+							}
+						}
+					}
+					if(bestIdx >= 0){
+						ov.marks[bestIdx] = Mark::Guess;
+					}
+				} else {
+					int bestIdx=-1; int bestDist=std::numeric_limits<int>::max();
+					for(int y=0;y<h;++y){ for(int x=0;x<w;++x){ if(board.at(x,y)==CellState::Unknown){ int dx=x-cx, dy=y-cy; int d=dx*dx+dy*dy; if(d<bestDist){ bestDist=d; bestIdx=to_index(x,y,w);} } } }
+					if(bestIdx>=0) ov.marks[bestIdx]=Mark::Guess;
+				}
+			}
+		}
 
 	return ov;
 }
