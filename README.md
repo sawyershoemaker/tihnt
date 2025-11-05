@@ -4,7 +4,7 @@
 
 #
 
-TIHNT or the Tile Information & Hidden Node Toolkit (holy backronym) is a project that serves as an overlay/cheat for https://minesweeper.online. 
+**TIHNT** or the *Tile Information & Hidden Node Toolkit* (holy backronym) is a project that serves as an overlay/cheat for https://minesweeper.online. 
 
 ## 2-part system
 - desktop overlay written in cpp with a small Windows UI layer and websocket server for game data
