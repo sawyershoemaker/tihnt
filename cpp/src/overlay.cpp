@@ -367,10 +367,17 @@ void OverlayWindow::redraw(bool full){
                 } else if(m==solve::Mark::Chord){
                     // blue 'F' on the numbered cell to click for chord (fully opaque)
                     drawGlyphFScaled(cx0, cy0, cx1, cy1, 0xFF1E90FF);
+                } else if(m==solve::Mark::ChordReady){
+                    // yellow 'F' when all supporting flags are already placed
+                    drawGlyphFScaled(cx0, cy0, cx1, cy1, 0xFFFFD700);
                 } else if(m==solve::Mark::FlagForChord){
                     // blue filled square on mines that need flagging for the shown chord
                     fillRect(cx0, cy0, cx1, cy1, 0x661E90FF);
                     drawRectStroke(cx0, cy0, cx1, cy1, 0xFF1E90FF);
+                } else if(m==solve::Mark::FlagForChordReady){
+                    // yellow overlay for chord-supporting tiles that are already flagged
+                    fillRect(cx0, cy0, cx1, cy1, 0x66FFD700);
+                    drawRectStroke(cx0, cy0, cx1, cy1, 0xFFFFD700);
                 }
             }
         }

@@ -7,7 +7,16 @@
 
 namespace solve {
 
-enum class Mark : uint8_t { None = 0, Safe = 1, Mine = 2, Guess = 3, Chord = 4, FlagForChord = 5 };
+enum class Mark : uint8_t {
+	None = 0,
+	Safe = 1,
+	Mine = 2,
+	Guess = 3,
+	Chord = 4,              // chord center that still needs supporting flags placed
+	FlagForChord = 5,       // cell that should be flagged to prepare a chord
+	ChordReady = 6,         // chord center with all required flags already placed
+	FlagForChordReady = 7   // cell already flagged and contributing to a chord
+};
 
 struct Overlay {
 	std::vector<Mark> marks;

@@ -293,15 +293,25 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 if(missing == 0){
                     int safeClicks = unknownCount;
                     if(safeClicks > 1){
-                        if(ov.marks[idx] == Mark::None){ ov.marks[idx] = Mark::Chord; }
+                        bool hasPlacedFlags = (flagged > 0);
+                        if(hasPlacedFlags){
+                            if(ov.marks[idx] == Mark::None || ov.marks[idx] == Mark::Chord){
+                                ov.marks[idx] = Mark::ChordReady;
+                            }
+                        } else if(ov.marks[idx] == Mark::None){
+                            ov.marks[idx] = Mark::Chord;
+                        }
                     }
                 } else {
 					if(neededCnt == missing){
                         int chordCost = missing + 1;
                         int safeClicks = unknownCount - missing;
                         if(chordCost < safeClicks){
-							if(ov.marks[idx] == Mark::None){ ov.marks[idx] = Mark::Chord; }
-                            for(int t=0; t<neededCnt; ++t){ int nb = neededMineIdx[t]; if(cells[nb] != CellState::Mine){ ov.marks[nb] = Mark::FlagForChord; } }
+							if(ov.marks[idx] == Mark::None || ov.marks[idx] == Mark::ChordReady){ ov.marks[idx] = Mark::Chord; }
+                            for(int t=0; t<neededCnt; ++t){
+                                int nb = neededMineIdx[t];
+                                ov.marks[nb] = Mark::FlagForChord;
+                            }
 						}
 					}
 				}
@@ -802,19 +812,25 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
     // chord valuation using probabilities and cascace heuristic
     if(enableChords && ov.mineProbability.size()==(size_t)N){
         // clear prior chord/flag marks while preserving Safe/Mine/Guess
-        for(int i=0;i<N;++i){ if(ov.marks[i]==Mark::Chord || ov.marks[i]==Mark::FlagForChord) ov.marks[i]=Mark::None; }
-        auto willFlagForChord = [&](int idx)->bool{ return ov.marks[idx]==Mark::Mine && cells[idx]!=CellState::Mine; };
+        for(int i=0;i<N;++i){
+            if(ov.marks[i]==Mark::Chord || ov.marks[i]==Mark::FlagForChord
+               || ov.marks[i]==Mark::ChordReady || ov.marks[i]==Mark::FlagForChordReady){
+                ov.marks[i]=Mark::None;
+            }
+        }
         const double kProbEps = 1e-9;
 
         struct ChordCandidate {
             int centerIdx;
             int missing;
             std::vector<int> unknowns;
-            std::vector<int> flagList; // flags to place for this chord
-            int clicks; // flags to place (excluding already-flagged board cells) + 1 chord click
-            double expectedValue; // reveals + cascade
-            double bestSingle; // best single-click alternative near this center
-            bool inProgress; // true if user just placed a flag enabling a break-even chord
+            std::vector<int> flagList;        // all required flags (pending + already placed)
+            std::vector<int> pendingFlags;    // subset that still need to be placed
+            std::vector<int> readyFlags;      // subset already flagged on the live board
+            int clicks;                       // flags to place (excluding already-flagged board cells) + 1 chord click
+            double expectedValue;             // reveals + cascade
+            double bestSingle;                // best single-click alternative near this center
+            bool inProgress;                  // true if user just placed a flag enabling a break-even chord
         };
 
         auto computeExpected = [&](const std::vector<int>& unknowns, const std::vector<int>& plannedFlags, int centerA, int centerB, double dampen)->std::pair<double,double>{
@@ -866,12 +882,14 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
                 int flagged=0; std::vector<int> unknowns; unknowns.reserve(8);
                 std::vector<int> needFlags; needFlags.reserve(8);
+                std::vector<int> placedFlags; placedFlags.reserve(8);
                 int userFlags = 0; // flags present on board but not deduced by solver
                 for(int k=0;k<neighborCounts[idx];++k){
                     int nb = neighbors[idx][k];
                     CellState s = cells[nb];
                     if(s==CellState::Mine){
                         flagged++;
+                        placedFlags.push_back(nb);
                         if(ov.marks[nb] != Mark::Mine) userFlags++;
                         continue;
                     }
@@ -900,8 +918,31 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                     }
                 }
 
-                int numFlagsToPlace = 0; for(int f : certainFlags){ if(cells[f] != CellState::Mine) numFlagsToPlace++; }
-                int clicks = (missing==0) ? 1 : (numFlagsToPlace + 1);
+                for(int fPlaced : placedFlags){
+                    bool exists=false;
+                    for(int v : certainFlags){ if(v==fPlaced){ exists=true; break; } }
+                    if(!exists){ certainFlags.push_back(fPlaced); }
+                }
+
+                std::vector<int> pendingFlags; pendingFlags.reserve(certainFlags.size());
+                std::vector<int> readyFlags; readyFlags.reserve(certainFlags.size());
+                for(int f : certainFlags){
+                    if(cells[f] == CellState::Mine){
+                        readyFlags.push_back(f);
+                    } else {
+                        pendingFlags.push_back(f);
+                    }
+                }
+
+                int safeReveals = (int)unknowns.size() - (int)pendingFlags.size();
+                if(safeReveals <= 0){
+                    continue;
+                }
+
+                int clicks = (int)pendingFlags.size() + 1;
+                if(clicks >= safeReveals){
+                    continue;
+                }
 
                 auto ev = computeExpected(unknowns, certainFlags, idx, -1, kCascadeDampen);
                 double totalValue = ev.first + ev.second;
@@ -909,7 +950,18 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 double bestAltSingles = computeBestKSingles(unknowns, certainFlags, idx, -1, kCascadeDampen, budgetK);
 
                 bool inProgress = (missing==0 && (int)unknowns.size()==1 && userFlags>0);
-                candidates.push_back(ChordCandidate{ idx, missing, std::move(unknowns), std::move(certainFlags), clicks, totalValue, bestAltSingles, inProgress });
+                candidates.push_back(ChordCandidate{
+                    idx,
+                    missing,
+                    std::move(unknowns),
+                    std::move(certainFlags),
+                    std::move(pendingFlags),
+                    std::move(readyFlags),
+                    clicks,
+                    totalValue,
+                    bestAltSingles,
+                    inProgress
+                });
             }
         }
 
@@ -965,30 +1017,89 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         // greedy select non-overlapping best pairs
         std::vector<uint8_t> picked(candidates.size(), 0);
+        std::vector<uint8_t> selected(candidates.size(), 0);
         std::sort(pairPicks.begin(), pairPicks.end(), [](const PairPick& a, const PairPick& b){ return a.improvement > b.improvement; });
         for(const auto& p : pairPicks){
             if(picked[p.a] || picked[p.b]) continue;
-            // mark both chords and required flags
-            const auto& A = candidates[p.a]; const auto& B = candidates[p.b];
-            if(ov.marks[A.centerIdx]==Mark::None) ov.marks[A.centerIdx]=Mark::Chord;
-            if(ov.marks[B.centerIdx]==Mark::None) ov.marks[B.centerIdx]=Mark::Chord;
-            for(int f : p.unionFlags){ if(cells[f] != CellState::Mine){ ov.marks[f]=Mark::FlagForChord; } }
             picked[p.a]=picked[p.b]=1;
+            selected[p.a]=selected[p.b]=1;
         }
 
         // always keep in-progress single chords visible (user recently placed enabling flag)
-        for(int i=0;i<(int)candidates.size();++i){ if(picked[i]) continue; const auto& C = candidates[i];
-            if(C.inProgress){ if(ov.marks[C.centerIdx]==Mark::None) ov.marks[C.centerIdx]=Mark::Chord; picked[i]=1; }
+        for(int i=0;i<(int)candidates.size();++i){
+            if(picked[i]) continue;
+            const auto& C = candidates[i];
+            if(C.inProgress){
+                picked[i]=1;
+                selected[i]=1;
+            }
         }
 
         // pick remaining profitable singles
-        for(int i=0;i<(int)candidates.size();++i){ if(picked[i]) continue; const auto& C = candidates[i];
+        for(int i=0;i<(int)candidates.size();++i){
+            if(picked[i]) continue;
+            const auto& C = candidates[i];
             // baseline: same click budget on best singles
             double improvement = C.expectedValue - C.bestSingle;
             if(improvement > kMargin){
-                if(ov.marks[C.centerIdx]==Mark::None) ov.marks[C.centerIdx]=Mark::Chord;
-                for(int f : C.flagList){ if(cells[f] != CellState::Mine){ ov.marks[f]=Mark::FlagForChord; } }
                 picked[i]=1;
+                selected[i]=1;
+            }
+        }
+
+        if(!selected.empty()){
+            const uint8_t kReadyBit = 0x1;
+            const uint8_t kPendingBit = 0x2;
+            std::vector<uint8_t> chordMask(N, 0);
+            std::vector<uint8_t> flagMask(N, 0);
+
+            for(size_t i=0; i<candidates.size(); ++i){
+                if(!selected[i]) continue;
+                const auto& C = candidates[i];
+                bool chordReady = !C.flagList.empty() && C.pendingFlags.empty();
+                if(chordReady){
+                    chordMask[C.centerIdx] |= kReadyBit;
+                } else {
+                    chordMask[C.centerIdx] |= kPendingBit;
+                }
+                for(int f : C.readyFlags){
+                    flagMask[f] |= chordReady ? kReadyBit : kPendingBit;
+                }
+                for(int f : C.pendingFlags){
+                    flagMask[f] |= kPendingBit;
+                }
+            }
+
+            for(int idx=0; idx<N; ++idx){
+                uint8_t mask = chordMask[idx];
+                if(mask == 0) continue;
+                bool pending = (mask & kPendingBit) != 0;
+                bool ready = (mask & kReadyBit) != 0;
+                if(pending){
+                    if(ov.marks[idx]==Mark::None || ov.marks[idx]==Mark::Chord || ov.marks[idx]==Mark::ChordReady){
+                        ov.marks[idx] = Mark::Chord;
+                    }
+                } else if(ready){
+                    if(ov.marks[idx]==Mark::None || ov.marks[idx]==Mark::Chord || ov.marks[idx]==Mark::ChordReady){
+                        ov.marks[idx] = Mark::ChordReady;
+                    }
+                }
+            }
+
+            for(int idx=0; idx<N; ++idx){
+                uint8_t mask = flagMask[idx];
+                if(mask == 0) continue;
+                bool pending = (mask & kPendingBit) != 0;
+                bool ready = (mask & kReadyBit) != 0;
+                if(pending){
+                    if(cells[idx] != CellState::Mine){
+                        ov.marks[idx] = Mark::FlagForChord;
+                    }
+                } else if(ready){
+                    if(cells[idx] == CellState::Mine){
+                        ov.marks[idx] = Mark::FlagForChordReady;
+                    }
+                }
             }
         }
     }
@@ -1015,7 +1126,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 if(remaining2 == 0 && ucount2 > 0){
                     for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} }
                 } else if(remaining2 == ucount2 && ucount2>0){
-                    for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] == Mark::FlagForChord){ continue; } if(ov.marks[u] != Mark::Mine){ ov.marks[u] = Mark::Mine; enqueueNbrNumbers(u);} }
+                    for(int i=0;i<ucount2;++i){
+                        int u=unknownIdx2[i];
+                        if(ov.marks[u] == Mark::FlagForChord || ov.marks[u] == Mark::FlagForChordReady){ continue; }
+                        if(ov.marks[u] != Mark::Mine){ ov.marks[u] = Mark::Mine; enqueueNbrNumbers(u);}
+                    }
                 }
             }
             // refresh guaranteed safe after propagation
