@@ -20,7 +20,7 @@
 - **Shift + M** — Enter mine amount (helps with guesses)
 - **Ctrl + Alt + X** — Close overlay
 - **Ctrl + P** — Toggle chording
-- **Ctrl + W**— Toggle stream-proof mode
+- **Ctrl + Alt + Shift + W**— Toggle stream-proof mode
 - **Ctrl + Alt + S** — Toggle safety
 - **Ctrl + Q**— Resend full board
 

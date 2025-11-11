@@ -64,7 +64,7 @@ int main(){
     const int kHotkeyToggleSafety = 4;
     RegisterHotKey(nullptr, kHotkeyExit, MOD_CONTROL | MOD_ALT | 0x4000, 'X');
     RegisterHotKey(nullptr, kHotkeyToggleChords, MOD_CONTROL | 0x4000, 'P');
-    RegisterHotKey(nullptr, kHotkeyToggleCapture, MOD_CONTROL | 0x4000, 'W');
+    RegisterHotKey(nullptr, kHotkeyToggleCapture, MOD_CONTROL | MOD_ALT | MOD_SHIFT | 0x4000, 'W');
     RegisterHotKey(nullptr, kHotkeyToggleSafety, MOD_CONTROL | MOD_ALT | 0x4000, 'S');
 #endif
     std::ios::sync_with_stdio(false);

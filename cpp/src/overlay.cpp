@@ -547,6 +547,7 @@ void OverlayWindow::set_excluded_from_capture(bool exclude){
         }
         // reflect actual state by querying current affinity when possible
         refresh_exclusion_state();
+        redraw(true);
     }
 #else
     (void)exclude;
@@ -583,7 +584,7 @@ void OverlayWindow::set_safety_mode(bool enabled){
         if(enabled){ ex &= ~WS_EX_TRANSPARENT; } else { ex |= WS_EX_TRANSPARENT; }
         SetWindowLongPtr(hwnd_, GWL_EXSTYLE, ex);
         SetWindowPos(hwnd_, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        redraw(true);
     }
 #endif
 }
