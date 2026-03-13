@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <random>
 #include <atomic>
@@ -412,16 +413,20 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				std::vector<uint8_t> assign(C.m, 255);
 				size_t nodeBudget = ENUM_NODE_BUDGET;
 				bool aborted = false;
+			auto checkConstraintsFor = [&](int var)->bool{
+					for(int ci : varToCons[var]){
+						const auto& con = C.cons[ci];
+						int need = con.num - con.knownMines;
+						int placed=0, unk=0;
+						for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
+						if(need < placed || need > placed + unk) return false;
+					}
+					return true;
+				};
 			std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
 				if(aborted) return;
 				if(nodeBudget == 0){ aborted = true; return; }
 				--nodeBudget;
-				for(const auto& con : C.cons){
-					int need = con.num - con.knownMines;
-					int placed=0, unk=0;
-					for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
-					if(need < placed) return; if(need > placed + unk) return;
-				}
 				if(idx==C.m){
 					R.totalSolutions += 1.0L;
 					R.waysK[minesSoFar] += 1.0L;
@@ -429,9 +434,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					return;
 				}
 				int var = order[idx];
-				assign[var]=0; dfs(idx+1, minesSoFar);
-				if(aborted) return;
-				assign[var]=1; dfs(idx+1, minesSoFar+1);
+				assign[var]=0;
+				if(checkConstraintsFor(var)){ dfs(idx+1, minesSoFar); }
+				if(aborted){ assign[var]=255; return; }
+				assign[var]=1;
+				if(checkConstraintsFor(var)){ dfs(idx+1, minesSoFar+1); }
 				assign[var]=255;
 			};
 				dfs(0,0);
@@ -534,57 +541,85 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 			}
 		}
 		if(needApprox){
-				// belief propagation fallback
 				struct EdgeRef { int conIndex; int posInCon; };
 				std::vector<std::vector<EdgeRef>> varEdges(C.m);
 				for(int j=0;j<(int)C.cons.size();++j){ const auto& con=C.cons[j]; for(int p=0;p<(int)con.uidx.size();++p){ int v=con.uidx[p]; varEdges[v].push_back({j,p}); } }
-				auto findEdgeIndex = [&](int v, int conIndex)->int{ const auto& edges=varEdges[v]; for(int i=0;i<(int)edges.size();++i){ if(edges[i].conIndex==conIndex) return i; } return -1; };
+				std::vector<std::vector<int>> edgeIndexLookup(C.m);
+				for(int v=0; v<C.m; ++v){ edgeIndexLookup[v].assign((int)C.cons.size(), -1); for(int i=0;i<(int)varEdges[v].size();++i){ edgeIndexLookup[v][varEdges[v][i].conIndex]=i; } }
 				std::vector<std::vector<double>> vToF(C.m), fToV(C.cons.size());
 				for(int v=0; v<C.m; ++v){ vToF[v].assign(varEdges[v].size(), 0.5); }
 				for(size_t j=0;j<C.cons.size();++j){ fToV[j].assign(C.cons[j].uidx.size(), 0.5); }
 				const int BP_MAX_ITERS = 20; const double BP_DAMP = 0.5; const double BP_EPS = 1e-6;
+				int maxConSize = 0; for(const auto& con : C.cons){ maxConSize = std::max(maxConSize, (int)con.uidx.size()); }
+				std::vector<long double> dpBuf(maxConSize+1), ndpBuf(maxConSize+1);
+				int maxDeg = 0; for(int v=0;v<C.m;++v){ maxDeg = std::max(maxDeg, (int)varEdges[v].size()); }
+				std::vector<double> pref1Buf(maxDeg+1), pref0Buf(maxDeg+1), suf1Buf(maxDeg+1), suf0Buf(maxDeg+1);
 				for(int it=0; it<BP_MAX_ITERS; ++it){
 					for(int j=0;j<(int)C.cons.size(); ++j){
 						const auto& con = C.cons[j];
-						const int s = (int)con.uidx.size();
+						const int sz = (int)con.uidx.size();
 						const int need = con.num - con.knownMines;
-						for(int p=0; p<s; ++p){
-							std::vector<long double> dp(s, 0.0L); dp[0]=1.0L;
-							for(int q=0; q<s; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=findEdgeIndex(vv,j); double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
-								std::vector<long double> ndp(s, 0.0L);
-								for(int k=0;k<s-1;++k){ if(dp[k]==0.0L) continue; ndp[k] += dp[k]*(1.0L-(long double)prob); ndp[k+1]+=dp[k]*(long double)prob; }
-								dp.swap(ndp);
+						for(int p=0; p<sz; ++p){
+							for(int k=0;k<sz;++k) dpBuf[k]=0.0L;
+							dpBuf[0]=1.0L;
+							for(int q=0; q<sz; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=edgeIndexLookup[vv][j]; double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
+								for(int k=0;k<sz;++k) ndpBuf[k]=0.0L;
+								for(int k=0;k<sz-1;++k){ if(dpBuf[k]==0.0L) continue; ndpBuf[k] += dpBuf[k]*(1.0L-(long double)prob); ndpBuf[k+1]+=dpBuf[k]*(long double)prob; }
+								std::swap(dpBuf,ndpBuf);
 							}
-							long double A=0.0L,B=0.0L; if(need-1>=0 && need-1<=s-1) A=dp[need-1]; if(need>=0 && need<=s-1) B=dp[need];
-							double msg=0.5; if(A==0.0L && B==0.0L) msg=0.5; else if(A==0.0L) msg=0.0; else if(B==0.0L) msg=1.0; else { double a=(double)A,b=(double)B; msg=a/(a+b);} 
+							long double A=0.0L,B=0.0L; if(need-1>=0 && need-1<=sz-1) A=dpBuf[need-1]; if(need>=0 && need<=sz-1) B=dpBuf[need];
+							double msg=0.5; if(A==0.0L && B==0.0L) msg=0.5; else if(A==0.0L) msg=0.0; else if(B==0.0L) msg=1.0; else { double a=(double)A,b=(double)B; msg=a/(a+b);}
 							msg = BP_DAMP * fToV[j][p] + (1.0 - BP_DAMP) * std::min(1.0-1e-9, std::max(1e-9, msg));
 							fToV[j][p] = msg;
 						}
 					}
-					for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); if(deg==0) continue; std::vector<double> pref1(deg+1,1.0),pref0(deg+1,1.0); for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; pref1[i+1]=pref1[i]*m1; pref0[i+1]=pref0[i]*(1.0-m1);} std::vector<double> suf1(deg+1,1.0),suf0(deg+1,1.0); for(int i=deg-1;i>=0;--i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; suf1[i]=suf1[i+1]*m1; suf0[i]=suf0[i+1]*(1.0-m1);} for(int i=0;i<deg;++i){ double p1=pref1[i]*suf1[i+1]; double p0=pref0[i]*suf0[i+1]; double msg=(p1==0.0 && p0==0.0)?0.5:(p1/(p1+p0)); msg=std::min(1.0-BP_EPS, std::max(BP_EPS, msg)); vToF[v][i] = BP_DAMP * vToF[v][i] + (1.0 - BP_DAMP) * msg; } }
+					for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); if(deg==0) continue;
+						pref1Buf[0]=1.0; pref0Buf[0]=1.0;
+						for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; pref1Buf[i+1]=pref1Buf[i]*m1; pref0Buf[i+1]=pref0Buf[i]*(1.0-m1);}
+						suf1Buf[deg]=1.0; suf0Buf[deg]=1.0;
+						for(int i=deg-1;i>=0;--i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; suf1Buf[i]=suf1Buf[i+1]*m1; suf0Buf[i]=suf0Buf[i+1]*(1.0-m1);}
+						for(int i=0;i<deg;++i){ double p1=pref1Buf[i]*suf1Buf[i+1]; double p0=pref0Buf[i]*suf0Buf[i+1]; double msg=(p1==0.0 && p0==0.0)?0.5:(p1/(p1+p0)); msg=std::min(1.0-BP_EPS, std::max(BP_EPS, msg)); vToF[v][i] = BP_DAMP * vToF[v][i] + (1.0 - BP_DAMP) * msg; } }
 				}
 				R.beliefs.assign(C.m, 0.5);
 				for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); double prod1=1.0,prod0=1.0; for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; prod1*=m1; prod0*=(1.0-m1);} double p = (prod1==0.0&&prod0==0.0)?0.5:(prod1/(prod1+prod0)); p=std::min(1.0-BP_EPS, std::max(BP_EPS, p)); R.beliefs[v]=p; }
 			}
 
-            // optional SAT forcedness for non-enumerated components
             if(C.m>0 && (int)C.cons.size()>0 && !R.enumerated){
                 std::vector<uint8_t> baseAssign(C.m, 255);
                 for(int t=0;t<C.m;++t){ int g=C.U[t]; if(g>=0 && g<N){ if(ov.marks[g]==Mark::Mine) baseAssign[t]=1; else if(ov.marks[g]==Mark::Safe) baseAssign[t]=0; } }
                 std::vector<int> degree2(C.m,0); for(const auto& con:C.cons){ for(int ui:con.uidx){ if(ui>=0 && ui<C.m) degree2[ui]++; } }
                 std::vector<int> order2(C.m); for(int i=0;i<C.m;++i) order2[i]=i; std::sort(order2.begin(), order2.end(), [&](int a,int b){ if(degree2[a]!=degree2[b]) return degree2[a]>degree2[b]; return a<b; });
                 size_t nodeBudget = 500000;
+                auto checkConsFor = [&](const std::vector<uint8_t>& assign, int var)->bool{
+                    for(int ci : varToCons[var]){
+                        const auto& con = C.cons[ci];
+                        int need = con.num - con.knownMines; int placed=0, unk=0;
+                        for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
+                        if(need < placed || need > placed + unk) return false;
+                    }
+                    return true;
+                };
                 std::function<bool(std::vector<uint8_t>&, int, size_t&)> dfsSat = [&](std::vector<uint8_t>& assign, int idx, size_t& budget)->bool{
                     if(budget==0) return false;
-                    for(const auto& con : C.cons){ int need=con.num - con.knownMines; int placed=0, unk=0; for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; } if(need < placed) return false; if(need > placed + unk) return false; }
                     if(idx==C.m) return true;
-                    int var = order2[idx]; if(assign[var]!=255) return dfsSat(assign, idx+1, budget);
-                    assign[var]=0; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
-                    assign[var]=255; assign[var]=1; if(budget>0){ --budget; if(dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; } }
+                    int var = order2[idx];
+                    if(assign[var]!=255) return dfsSat(assign, idx+1, budget);
+                    assign[var]=0; --budget;
+                    if(checkConsFor(assign, var) && dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; }
+                    assign[var]=1; if(budget>0){ --budget;
+                        if(checkConsFor(assign, var) && dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; }
+                    }
                     assign[var]=255; return false;
                 };
                 auto isForced = [&](int varIdx)->int{
-                    if(baseAssign[varIdx]==0) return 0; if(baseAssign[varIdx]==1) return 1; std::vector<uint8_t> a0=baseAssign; a0[varIdx]=0; size_t b0=nodeBudget; bool sat0=dfsSat(a0,0,b0); std::vector<uint8_t> a1=baseAssign; a1[varIdx]=1; size_t b1=nodeBudget; bool sat1=dfsSat(a1,0,b1); if(sat0 && !sat1) return 0; if(!sat0 && sat1) return 1; return -1; };
+                    if(baseAssign[varIdx]==0) return 0;
+                    if(baseAssign[varIdx]==1) return 1;
+                    std::vector<uint8_t> a0=baseAssign; a0[varIdx]=0; size_t b0=nodeBudget;
+                    bool sat0 = checkConsFor(a0, varIdx) && dfsSat(a0,0,b0);
+                    std::vector<uint8_t> a1=baseAssign; a1[varIdx]=1; size_t b1=nodeBudget;
+                    bool sat1 = checkConsFor(a1, varIdx) && dfsSat(a1,0,b1);
+                    if(sat0 && !sat1) return 0; if(!sat0 && sat1) return 1; return -1;
+                };
                 for(int t=0;t<C.m;++t){ int forced=isForced(t); if(forced==0) R.forcedSafe.push_back(C.U[t]); else if(forced==1) R.forcedMine.push_back(C.U[t]); }
             }
 
@@ -946,7 +981,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
                 auto ev = computeExpected(unknowns, certainFlags, idx, -1, kCascadeDampen);
                 double totalValue = ev.first + ev.second;
-                int budgetK = clicks; // alternative: spend the same number of clicks on best singles
+                int budgetK = clicks; // alternatively spend the same number of clicks on best singles
                 double bestAltSingles = computeBestKSingles(unknowns, certainFlags, idx, -1, kCascadeDampen, budgetK);
 
                 bool inProgress = (missing==0 && (int)unknowns.size()==1 && userFlags>0);
@@ -965,7 +1000,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             }
         }
 
-        // find synergistic pairs that can share flags; prefer pairs with strong positive net improvement
+        // find synergistic pairs that can share flags and prefer pairs with strong positive net improvement
         struct PairPick { int a; int b; int clicks; double value; double bestTwoSingles; double improvement; std::vector<int> unionFlags; std::vector<int> unionUnknowns; };
         std::vector<PairPick> pairPicks; pairPicks.reserve(candidates.size());
 
@@ -977,41 +1012,65 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         const double kMargin = 1e-3;
 
-        for(int i=0;i<(int)candidates.size();++i){
-            for(int j=i+1;j<(int)candidates.size();++j){
-                const auto& A = candidates[i]; const auto& B = candidates[j];
-                // spatial locality: only consider if centers are neighbors or share unknown/flags
-                int ax=A.centerIdx%w, ay=A.centerIdx/w; int bx=B.centerIdx%w, by=B.centerIdx/w;
-                int dx = std::abs(ax-bx), dy = std::abs(ay-by);
-                bool close = (dx<=2 && dy<=2);
-                if(!close){
-                    bool overlap=false;
-                    for(int u1 : A.unknowns){ for(int u2 : B.unknowns){ if(u1==u2){ overlap=true; break; } } if(overlap) break; }
-                    if(!overlap){
-                        for(int f1 : A.flagList){ for(int f2 : B.flagList){ if(f1==f2){ overlap=true; break; } } if(overlap) break; }
+        // spatial grid so group candidate indices by board position
+        std::vector<std::vector<int>> candGrid(N);
+        for(int ci=0;ci<(int)candidates.size();++ci) candGrid[candidates[ci].centerIdx].push_back(ci);
+        // cell index sets per candidate for fast overlap checks
+        std::vector<std::unordered_set<int>> unkSets(candidates.size()), flagSets(candidates.size());
+        for(int ci=0;ci<(int)candidates.size();++ci){
+            unkSets[ci].insert(candidates[ci].unknowns.begin(), candidates[ci].unknowns.end());
+            flagSets[ci].insert(candidates[ci].flagList.begin(), candidates[ci].flagList.end());
+        }
+
+        auto tryPair = [&](int i, int j){
+            if(i >= j) return;
+            const auto& A = candidates[i]; const auto& B = candidates[j];
+            std::vector<int> flagUnion = unionUnique(A.flagList, B.flagList);
+            int flagsToPlace=0; for(int f : flagUnion){ if(cells[f] != CellState::Mine) flagsToPlace++; }
+            int pairClicks = flagsToPlace + 2;
+            std::vector<int> unknownUnion = unionUnique(A.unknowns, B.unknowns);
+            auto evPair = computeExpected(unknownUnion, flagUnion, A.centerIdx, B.centerIdx, kCascadeDampen);
+            double pairValue = evPair.first + evPair.second;
+            double bestKSinglesPair = computeBestKSingles(unknownUnion, flagUnion, A.centerIdx, B.centerIdx, kCascadeDampen, pairClicks);
+            double improvement = pairValue - bestKSinglesPair;
+            if(improvement > kMargin){
+                pairPicks.push_back(PairPick{ i, j, pairClicks, pairValue, bestKSinglesPair, improvement, std::move(flagUnion), std::move(unknownUnion) });
+            }
+        };
+
+        // spatial grid traversal so only consider pairs within +-2 cells or sharing unknowns/flags
+        std::unordered_set<uint64_t> visited;
+        for(int ci=0;ci<(int)candidates.size();++ci){
+            int cx = candidates[ci].centerIdx % w, cy = candidates[ci].centerIdx / w;
+            for(int dy=-2; dy<=2; ++dy){ for(int dx=-2; dx<=2; ++dx){
+                int nx=cx+dx, ny=cy+dy;
+                if(nx<0||nx>=w||ny<0||ny>=h) continue;
+                for(int cj : candGrid[ny*w+nx]){
+                    if(cj<=ci) continue;
+                    uint64_t key = ((uint64_t)ci<<32)|(uint64_t)cj;
+                    if(visited.count(key)) continue;
+                    visited.insert(key);
+                    tryPair(ci, cj);
+                }
+            }}
+            for(int u : candidates[ci].unknowns){
+                int ux=u%w, uy=u/w;
+                for(int dy2=-1;dy2<=1;++dy2){ for(int dx2=-1;dx2<=1;++dx2){
+                    int nx=ux+dx2, ny=uy+dy2;
+                    if(nx<0||nx>=w||ny<0||ny>=h) continue;
+                    for(int cj : candGrid[ny*w+nx]){
+                        if(cj==ci) continue;
+                        uint64_t key = ci<cj ? ((uint64_t)ci<<32)|(uint64_t)cj : ((uint64_t)cj<<32)|(uint64_t)ci;
+                        if(visited.count(key)) continue;
+                        bool overlap = unkSets[cj].count(u) || flagSets[cj].count(u);
+                        if(!overlap){
+                            for(int f : candidates[ci].flagList){ if(unkSets[cj].count(f)||flagSets[cj].count(f)){ overlap=true; break; } }
+                        }
+                        if(!overlap) continue;
+                        visited.insert(key);
+                        tryPair(std::min(ci,cj), std::max(ci,cj));
                     }
-                    if(!overlap) continue;
-                }
-
-                // to share flags effectively, require that flags do not conflict, and both are safe chordable
-                std::vector<int> flagUnion = unionUnique(A.flagList, B.flagList);
-                // clicks for pair: unique flags to place + 2 chord clicks
-                int flagsToPlace=0; for(int f : flagUnion){ if(cells[f] != CellState::Mine) flagsToPlace++; }
-                int pairClicks = flagsToPlace + 2;
-
-                // unknown union used for valuation (avoid double counting)
-                std::vector<int> unknownUnion = unionUnique(A.unknowns, B.unknowns);
-
-                auto evPair = computeExpected(unknownUnion, flagUnion, A.centerIdx, B.centerIdx, kCascadeDampen);
-                double pairValue = evPair.first + evPair.second;
-
-                // baseline: spend the same number of clicks as the pair requires on the best singles
-                double bestKSinglesPair = computeBestKSingles(unknownUnion, flagUnion, A.centerIdx, B.centerIdx, kCascadeDampen, pairClicks);
-
-                double improvement = pairValue - bestKSinglesPair;
-                if(improvement > kMargin){
-                    pairPicks.push_back(PairPick{ i, j, pairClicks, pairValue, bestKSinglesPair, improvement, std::move(flagUnion), std::move(unknownUnion) });
-                }
+                }}
             }
         }
 

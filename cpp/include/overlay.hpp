@@ -46,7 +46,6 @@ public:
     bool is_safety_mode() const;
 
 #ifdef _WIN32
-    bool click_nearest_safe_guess();
     void set_target_pid(uint32_t pid);
 #endif
 
@@ -59,9 +58,6 @@ private:
     HWND findRenderHost();
     void hide();
     void show_noactivate();
-    bool human_move_to(int targetScreenX, int targetScreenY);
-    enum class ClickType : uint8_t { Left, Right, ChordBoth };
-    bool host_click_at_screen(int screenX, int screenY, ClickType type);
     bool refresh_exclusion_state();
 
     HWND hwnd_ = nullptr;
@@ -78,12 +74,12 @@ private:
     bool excluded_from_capture_ = false;
     bool visible_ = true;
     bool safety_mode_ = false;
+    std::vector<int> cached_xEdge_;
+    std::vector<int> cached_yEdge_;
+    int cached_dstW_ = 0;
+    int cached_dstH_ = 0;
 #ifdef _WIN32
-#  if defined(_WIN32)
     unsigned long target_pid_ = 0;
-#  else
-    unsigned long target_pid_ = 0;
-#  endif
 #endif
 };
 

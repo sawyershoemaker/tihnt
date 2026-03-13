@@ -27,7 +27,9 @@
     captureMode: false,
     captureBuffer: '',
     rect: { l: 0, t: 0, w: 0, h: 0 },
-    geometryDirty: true
+    geometryDirty: true,
+    cellCache: null,
+    cellCacheDirty: true
   };
   let lastNoBoardLog = 0;
 
@@ -112,7 +114,7 @@
           }
           if (needCapture && geometryTouched) break;
         }
-        if (geometryTouched) STATE.geometryDirty = true;
+        if (geometryTouched) { STATE.geometryDirty = true; STATE.cellCacheDirty = true; }
         if (needCapture) {
           scheduleCapture(geometryTouched ? 'mutation:geom' : 'mutation');
         }
@@ -153,7 +155,7 @@
         try { chrome.storage?.local?.set?.({ mines_total: next }); } catch {}
         log('capture mines mode: set', next, 'buffer=', STATE.captureBuffer);
         try {
-          const msg = { type: 'delta', updates: [], cell_px: STATE.cellPx, ox: STATE.origin.x, oy: STATE.origin.y, mines_total: n };
+          const msg = { type: 'delta', updates: [], cell_px: STATE.cellPx, ox: STATE.origin.x, oy: STATE.origin.y, mines_total: next };
           chrome.runtime.sendMessage(msg, () => {});
         } catch {}
         STATE.captureMode = false;
@@ -270,7 +272,11 @@
   }
 
   function capture() {
-    const cells = Array.from(document.querySelectorAll('div[id^="cell_"].cell'));
+    if (STATE.cellCacheDirty || !STATE.cellCache || STATE.cellCache.length === 0) {
+      STATE.cellCache = Array.from(document.querySelectorAll('div[id^="cell_"].cell'));
+      STATE.cellCacheDirty = false;
+    }
+    const cells = STATE.cellCache;
     if (cells.length === 0) return null;
 
     let maxX = -1;
@@ -446,6 +452,7 @@
       try {
         if (msg && msg.type === 'force_full') {
           STATE.geometryDirty = true;
+          STATE.cellCacheDirty = true;
           const s = capture();
           if (!s) { respond && respond({ ok: false }); return; }
           // Always send full regardless of timer/size change
@@ -472,9 +479,7 @@
   if (vv) {
     vv.addEventListener('scroll', () => { STATE.geometryDirty = true; scheduleGeometry('vv:scroll'); });
     vv.addEventListener('resize', () => { STATE.geometryDirty = true; scheduleGeometry('vv:resize'); });
-    if (typeof vv.addEventListener === 'function') {
-      vv.addEventListener('zoom', () => { STATE.geometryDirty = true; scheduleGeometry('vv:zoom'); });
-    }
+    vv.addEventListener('zoom', () => { STATE.geometryDirty = true; scheduleGeometry('vv:zoom'); });
   }
 
   const handleScroll = (reason) => () => { STATE.geometryDirty = true; scheduleGeometry(reason); };

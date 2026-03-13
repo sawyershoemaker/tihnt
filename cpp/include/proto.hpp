@@ -6,14 +6,11 @@
 
 namespace proto {
 
-struct FullMsg {
-    int w=0;
-    int h=0;
-    std::vector<game::CellState> cells;
+struct GeometryMsg {
     int cell_px=0;
     int origin_x=0;
     int origin_y=0;
-	int mines_total=-1;
+    int mines_total=-1;
     double rect_l=0.0;
     double rect_t=0.0;
     double rect_w=0.0;
@@ -23,20 +20,15 @@ struct FullMsg {
     double vv_scale=1.0;
     double dpr=1.0;
 };
-struct DeltaMsg {
+
+struct FullMsg : GeometryMsg {
+    int w=0;
+    int h=0;
+    std::vector<game::CellState> cells;
+};
+
+struct DeltaMsg : GeometryMsg {
     std::vector<game::CellUpdate> updates;
-    int cell_px=0;
-    int origin_x=0;
-    int origin_y=0;
-	int mines_total=-1;
-    double rect_l=0.0;
-    double rect_t=0.0;
-    double rect_w=0.0;
-    double rect_h=0.0;
-    double vv_x=0.0;
-    double vv_y=0.0;
-    double vv_scale=1.0;
-    double dpr=1.0;
 };
 
 struct BindMsg {

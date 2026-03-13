@@ -34,6 +34,7 @@ public:
 
     void apply_updates(const std::vector<CellUpdate>& updates);
     void apply_full(const std::vector<CellState>& all, int w, int h);
+    void apply_full(std::vector<CellState>&& all, int w, int h);
 
     std::vector<CellUpdate> diff(const Board& other) const;
 

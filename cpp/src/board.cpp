@@ -31,6 +31,10 @@ void Board::apply_full(const std::vector<CellState>& all, int w, int h){
     w_ = w; h_ = h; cells_ = all; if((int)cells_.size()!=w_*h_) cells_.assign(w_*h_, CellState::Unknown);
 }
 
+void Board::apply_full(std::vector<CellState>&& all, int w, int h){
+    w_ = w; h_ = h; cells_ = std::move(all); if((int)cells_.size()!=w_*h_) cells_.assign(w_*h_, CellState::Unknown);
+}
+
 std::vector<CellUpdate> Board::diff(const Board& other) const {
     std::vector<CellUpdate> d;
     if(w_!=other.w_||h_!=other.h_) return d;

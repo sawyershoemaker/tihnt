@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,6 +33,7 @@ public:
 
     bool is_connected() const {
 #ifdef _WIN32
+        std::lock_guard<std::mutex> lock(client_mutex_);
         return client_socket_ != INVALID_SOCKET;
 #else
         return false;
@@ -45,13 +47,16 @@ private:
 #ifdef _WIN32
     SOCKET listen_socket_ = INVALID_SOCKET;
     SOCKET client_socket_ = INVALID_SOCKET;
+    mutable std::mutex client_mutex_;
+    void close_client_locked();
 #endif
 
     std::thread accept_thread_;
+    std::thread client_thread_;
 
     bool perform_handshake(SOCKET s, const std::string& http_request);
     void accept_loop();
-    void client_loop();
+    void client_loop(SOCKET s);
 };
 
 }

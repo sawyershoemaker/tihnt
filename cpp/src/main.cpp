@@ -1,5 +1,4 @@
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cmath>
@@ -18,7 +17,6 @@
 #include <windows.h>
 #endif
 
-using namespace std::chrono_literals;
 
 std::atomic<int> g_mines_total{-1};
 std::atomic<bool> g_enable_chords{true};
@@ -62,10 +60,10 @@ int main(){
     const int kHotkeyToggleChords = 2;
     const int kHotkeyToggleCapture = 3;
     const int kHotkeyToggleSafety = 4;
-    RegisterHotKey(nullptr, kHotkeyExit, MOD_CONTROL | MOD_ALT | 0x4000, 'X');
-    RegisterHotKey(nullptr, kHotkeyToggleChords, MOD_CONTROL | 0x4000, 'P');
-    RegisterHotKey(nullptr, kHotkeyToggleCapture, MOD_CONTROL | MOD_ALT | MOD_SHIFT | 0x4000, 'W');
-    RegisterHotKey(nullptr, kHotkeyToggleSafety, MOD_CONTROL | MOD_ALT | 0x4000, 'S');
+    RegisterHotKey(nullptr, kHotkeyExit, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'X');
+    RegisterHotKey(nullptr, kHotkeyToggleChords, MOD_CONTROL | MOD_NOREPEAT, 'P');
+    RegisterHotKey(nullptr, kHotkeyToggleCapture, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'W');
+    RegisterHotKey(nullptr, kHotkeyToggleSafety, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S');
 #endif
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
@@ -77,6 +75,7 @@ int main(){
     std::mutex mtx;
     std::atomic<bool> dirty{false};
     std::atomic<bool> geomOnlyDirty{false};
+    HANDLE hWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     OverlayGeometry geom{};
 
@@ -87,7 +86,7 @@ int main(){
         {
             std::lock_guard<std::mutex> lock(mtx);
             if(parsed.type==proto::MsgType::Full){
-                board.apply_full(parsed.full.cells, parsed.full.w, parsed.full.h);
+                board.apply_full(std::move(parsed.full.cells), parsed.full.w, parsed.full.h);
                 int mt = parsed.full.mines_total; if(mt < -1) mt = -1; g_mines_total.store(mt);
                 geom.board_w = parsed.full.w; geom.board_h = parsed.full.h;
                 geom.rect_l = parsed.full.rect_l; geom.rect_t = parsed.full.rect_t; geom.rect_w = parsed.full.rect_w; geom.rect_h = parsed.full.rect_h;
@@ -126,9 +125,11 @@ int main(){
         }
         if(requestGeometryUpdate){
             geomOnlyDirty.store(true);
+            SetEvent(hWakeEvent);
         }
         if(requestSolver){
             dirty = true;
+            SetEvent(hWakeEvent);
         }
     });
 
@@ -174,6 +175,7 @@ int main(){
                 latestResult.seq = job.seq;
                 resultReady = true;
             }
+            SetEvent(hWakeEvent);
         }
     });
 
@@ -256,13 +258,14 @@ int main(){
         }
 
         if(!didSomething){
-            std::this_thread::sleep_for(2ms);
+            MsgWaitForMultipleObjects(1, &hWakeEvent, FALSE, 50, QS_ALLINPUT);
         }
     }
 #ifdef _WIN32
     UnregisterHotKey(nullptr, kHotkeyExit);
     UnregisterHotKey(nullptr, kHotkeyToggleChords);
     UnregisterHotKey(nullptr, kHotkeyToggleCapture);
+    UnregisterHotKey(nullptr, kHotkeyToggleSafety);
 #endif
     {
         std::lock_guard<std::mutex> lock(jobMutex);
@@ -274,6 +277,7 @@ int main(){
     }
     server.stop();
     overlay.destroy();
+    if(hWakeEvent) CloseHandle(hWakeEvent);
     return 0;
 }
 

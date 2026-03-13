@@ -98,10 +98,20 @@ void WebSocketServer::stop(){
     running_ = false;
 #ifdef _WIN32
     if(listen_socket_ != INVALID_SOCKET){ closesocket(listen_socket_); listen_socket_ = INVALID_SOCKET; }
-    if(client_socket_ != INVALID_SOCKET){ closesocket(client_socket_); client_socket_ = INVALID_SOCKET; }
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        close_client_locked();
+    }
 #endif
     if(accept_thread_.joinable()) accept_thread_.join();
+    if(client_thread_.joinable()) client_thread_.join();
 }
+
+#ifdef _WIN32
+void WebSocketServer::close_client_locked(){
+    if(client_socket_ != INVALID_SOCKET){ closesocket(client_socket_); client_socket_ = INVALID_SOCKET; }
+}
+#endif
 
 bool WebSocketServer::perform_handshake(SOCKET s, const std::string& http_request){
     std::string lower = http_request; for(char& c : lower){ if(c>='A'&&c<='Z') c = char(c - 'A' + 'a'); }
@@ -154,8 +164,16 @@ void WebSocketServer::accept_loop(){
                 if(kWsDebug){ std::cerr << "ws: received headers bytes=" << req.size() << std::endl; }
                 if(!req.empty() && perform_handshake(s, req)){
                     if(kWsDebug){ std::cerr << "ws: handshake ok" << std::endl; }
-                    client_socket_ = s;
-                    std::thread(&WebSocketServer::client_loop, this).detach();
+                    {
+                        std::lock_guard<std::mutex> lock(client_mutex_);
+                        close_client_locked();
+                    }
+                    if(client_thread_.joinable()) client_thread_.join();
+                    {
+                        std::lock_guard<std::mutex> lock(client_mutex_);
+                        client_socket_ = s;
+                    }
+                    client_thread_ = std::thread(&WebSocketServer::client_loop, this, s);
                 } else {
                     if(kWsDebug){ std::cerr << "ws: handshake failed" << std::endl; }
                     closesocket(s);
@@ -208,23 +226,28 @@ static bool ws_read_frame(SOCKET s, std::string& out_text){
     }
 }
 
-void WebSocketServer::client_loop(){
+void WebSocketServer::client_loop(SOCKET s){
 #ifdef _WIN32
-    SOCKET s = client_socket_;
     for(;;){
         std::string text; if(!ws_read_frame(s, text)) break;
         if(on_message_) on_message_(WsMessage{std::move(text)});
     }
-    closesocket(s);
-    client_socket_ = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        if(client_socket_ == s){
+            closesocket(s);
+            client_socket_ = INVALID_SOCKET;
+        }
+    }
 #endif
 }
 
 bool WebSocketServer::send_text(const std::string& data){
 #ifdef _WIN32
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if(client_socket_==INVALID_SOCKET) return false;
     std::string frame;
-    frame.push_back((char)0x81); // FIN + text
+    frame.push_back((char)0x81);
     size_t len = data.size();
     if(len<126){ frame.push_back((char)len); }
     else if(len<=0xFFFF){ frame.push_back(126); frame.push_back((char)((len>>8)&0xFF)); frame.push_back((char)(len&0xFF)); }

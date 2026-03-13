@@ -111,7 +111,10 @@ HWND OverlayWindow::findRenderHost(){
     static HWND lastHost = nullptr;
 
     HWND fg = GetForegroundWindow();
-    if(!fg || fg==hwnd_) return lastHost; // keep previous if available
+    if(!fg || fg==hwnd_){
+        if(lastHost && IsWindow(lastHost)) return lastHost;
+        return nullptr;
+    }
 
     if(fg == lastTop && lastHost && IsWindow(lastHost)){
         return lastHost;
@@ -250,31 +253,28 @@ void OverlayWindow::redraw(bool full){
         const int w = geom_.board_w;
         const int h = geom_.board_h;
         if(w>0 && h>0 && (int)marks_.size()==w*h){
-        // precompute per-cell pixel edges to avoid repeated rounding in the hot loop
         std::vector<int> x0(w+1), y0(h+1);
         for(int xx=0; xx<=w; ++xx){ x0[xx] = (int)std::round(((double)dstW * (double)xx) / (double)w); }
         for(int yy=0; yy<=h; ++yy){ y0[yy] = (int)std::round(((double)dstH * (double)yy) / (double)h); }
+        cached_xEdge_ = x0; cached_yEdge_ = y0;
+        cached_dstW_ = dstW; cached_dstH_ = dstH;
 
         // when safety mode is enabled, block clicks for entire cells that are NOT Safe/Guess
         // by painting a minimally visible (alpha=1) mask across those cells.
         if(safety_mode_){
-            const uint32_t kMaskBGRA = 0x01000000; // alpha=1, RGB=0 (premultiplied)
+            const uint32_t kMaskBGRA = 0x01000000;
             for(int yy=0; yy<h; ++yy){
                 const int cy0 = y0[yy];
                 const int cy1 = y0[yy+1] - 1;
                 for(int xx=0; xx<w; ++xx){
+                    solve::Mark m = marks_[yy*w + xx];
+                    if(m==solve::Mark::Safe || m==solve::Mark::Guess) continue;
                     const int cx0 = x0[xx];
                     const int cx1 = x0[xx+1] - 1;
-                    solve::Mark m = marks_[yy*w + xx];
-                    bool allow = (m==solve::Mark::Safe || m==solve::Mark::Guess);
-                    if(!allow){
-                        for(int py=cy0; py<=cy1; ++py){
-                            uint8_t* row = bits_ + py*stride_ + cx0*4;
-                            for(int px=cx0; px<=cx1; ++px){
-                                *reinterpret_cast<uint32_t*>(row) = kMaskBGRA;
-                                row += 4;
-                            }
-                        }
+                    const int span = cx1 - cx0 + 1;
+                    for(int py=cy0; py<=cy1; ++py){
+                        uint32_t* row = reinterpret_cast<uint32_t*>(bits_ + py*stride_) + cx0;
+                        std::fill_n(row, span, kMaskBGRA);
                     }
                 }
             }
@@ -464,11 +464,14 @@ LRESULT OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL: {
-        // while safety mode is active, forward wheel events to the underlying host (not working)
         if(safety_mode_){
-            HWND host = findRenderHost();
-            if(host){ PostMessage(host, msg, wp, lp); }
-            return 0; // eat it so overlay doesn't interfere
+            short delta = GET_WHEEL_DELTA_WPARAM(wp);
+            INPUT inp = {};
+            inp.type = INPUT_MOUSE;
+            inp.mi.mouseData = (DWORD)delta;
+            inp.mi.dwFlags = (msg == WM_MOUSEWHEEL) ? MOUSEEVENTF_WHEEL : MOUSEEVENTF_HWHEEL;
+            SendInput(1, &inp, sizeof(INPUT));
+            return 0;
         }
         break;
     }
@@ -476,27 +479,19 @@ LRESULT OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         // safety-mode selective pass-through: only allow clicks on Safe/Guess cells
         // otherwise, return HTCLIENT to block (prevent click-through)
         if(safety_mode_ && !marks_.empty() && geom_.board_w>0 && geom_.board_h>0){
-            // determine mouse position in overlay client coordinates (convert from screen)
             POINTS pts = MAKEPOINTS(lp);
             POINT p{ pts.x, pts.y };
             ScreenToClient(hwnd_, &p);
-            // map to cell indices using current surface size
-            RECT rc; GetClientRect(hwnd_, &rc);
-            int dstW = rc.right - rc.left;
-            int dstH = rc.bottom - rc.top;
-            if(dstW>0 && dstH>0){
+            const int w = geom_.board_w;
+            const int h = geom_.board_h;
+            const auto& xEdge = cached_xEdge_;
+            const auto& yEdge = cached_yEdge_;
+            if((int)xEdge.size()==w+1 && (int)yEdge.size()==h+1){
                 int x = p.x; int y = p.y;
-                const int w = geom_.board_w;
-                const int h = geom_.board_h;
-                // build the same rounded edge arrays used for drawing for consistent mapping
-                std::vector<int> xEdge(w+1), yEdge(h+1);
-                for(int xx=0; xx<=w; ++xx){ xEdge[xx] = (int)std::round(((double)dstW * (double)xx) / (double)w); }
-                for(int yy=0; yy<=h; ++yy){ yEdge[yy] = (int)std::round(((double)dstH * (double)yy) / (double)h); }
-                auto locate = [&](int px, int py, int& cx, int& cy){
-                    cx = -1; cy = -1;
-                    // find column
-                    for(int xx=0; xx<w; ++xx){ if(px >= xEdge[xx] && px <= xEdge[xx+1]-1){ cx = xx; break; } }
-                    for(int yy=0; yy<h; ++yy){ if(py >= yEdge[yy] && py <= yEdge[yy+1]-1){ cy = yy; break; } }
+                auto locate = [&](int px, int py, int& cellx, int& celly){
+                    cellx = -1; celly = -1;
+                    for(int xx=0; xx<w; ++xx){ if(px >= xEdge[xx] && px <= xEdge[xx+1]-1){ cellx = xx; break; } }
+                    for(int yy=0; yy<h; ++yy){ if(py >= yEdge[yy] && py <= yEdge[yy+1]-1){ celly = yy; break; } }
                 };
                 int cx=-1, cy=-1; locate(x,y,cx,cy);
                 auto isSafeGuessAt = [&](int ix, int iy)->bool{
@@ -506,11 +501,9 @@ LRESULT OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     auto m = marks_[idx];
                     return (m==solve::Mark::Safe || m==solve::Mark::Guess);
                 };
-                // if exact cell is safe/guess, pass through
                 if(cx>=0 && cy>=0 && isSafeGuessAt(cx,cy)){
                     return HTTRANSPARENT;
                 }
-                // otherwise, if the point lies inside any neighboring safe/guess cell rectangle, pass through
                 for(int dy=-1; dy<=1; ++dy){
                     for(int dx=-1; dx<=1; ++dx){
                         int nx = (cx<0? -1 : cx+dx);
@@ -523,7 +516,6 @@ LRESULT OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                         }
                     }
                 }
-                // all other areas: block
                 return HTCLIENT;
             }
         }
