@@ -1,0 +1,11 @@
+{
+  "name": "tihnt-checks",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/extension.test.cjs",
+    "test:browser": "node tests/browser-smoke.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

@@ -6,6 +6,12 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <algorithm>
+#include <chrono>
+#include <string_view>
+#include <unordered_map>
+#include "proto.hpp"
+#include "utf8.hpp"
 
 namespace {
 struct Sha1Ctx { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t idx; };
@@ -16,7 +22,7 @@ static void sha1_init(Sha1Ctx& c){ c.h[0]=0x67452301; c.h[1]=0xEFCDAB89; c.h[2]=
 
 static void sha1_block(Sha1Ctx& c){
     uint32_t w[80];
-    for(int i=0;i<16;++i){ w[i] = (c.buf[i*4]<<24)|(c.buf[i*4+1]<<16)|(c.buf[i*4+2]<<8)|(c.buf[i*4+3]); }
+    for(int i=0;i<16;++i){ w[i] = (uint32_t(c.buf[i*4])<<24)|(uint32_t(c.buf[i*4+1])<<16)|(uint32_t(c.buf[i*4+2])<<8)|uint32_t(c.buf[i*4+3]); }
     for(int i=16;i<80;++i){ w[i] = rol(w[i-3]^w[i-8]^w[i-14]^w[i-16],1); }
     uint32_t a=c.h[0],b=c.h[1],c2=c.h[2],d=c.h[3],e=c.h[4];
     for(int i=0;i<80;++i){
@@ -62,201 +68,316 @@ static std::string sha1_base64(const std::string& s){
 
 namespace net {
 
-WebSocketServer::WebSocketServer() : running_(false) {
+WebSocketServer::WebSocketServer() {
 #ifdef _WIN32
-    WSADATA wsaData; WSAStartup(MAKEWORD(2,2), &wsaData);
+    WSADATA data{};
+    winsock_ready_ = WSAStartup(MAKEWORD(2,2), &data) == 0;
 #endif
 }
 
 WebSocketServer::~WebSocketServer() {
     stop();
 #ifdef _WIN32
-    WSACleanup();
+    if(winsock_ready_) WSACleanup();
 #endif
 }
 
-void WebSocketServer::set_on_message(MessageCallback cb){ on_message_ = std::move(cb); }
+void WebSocketServer::set_on_message(MessageCallback cb) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    on_message_ = std::move(cb);
+}
+void WebSocketServer::set_on_connection(ConnectionCallback cb) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    on_connection_ = std::move(cb);
+}
+void WebSocketServer::notify_connection(bool connected) {
+    ConnectionCallback cb;
+    { std::lock_guard<std::mutex> lock(callback_mutex_); cb=on_connection_; }
+    if(cb) cb(connected);
+}
 
-bool WebSocketServer::start(uint16_t port){
+bool WebSocketServer::start(uint16_t port) {
+#ifdef _WIN32
     if(running_) return true;
-    running_ = true;
-#ifdef _WIN32
-    listen_socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(listen_socket_ == INVALID_SOCKET) return false;
-
-    u_long nonblock = 1; ioctlsocket(listen_socket_, FIONBIO, &nonblock);
-
-    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(port); addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if(bind(listen_socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))==SOCKET_ERROR) return false;
-    if(listen(listen_socket_, 1)==SOCKET_ERROR) return false;
-#endif
-    accept_thread_ = std::thread(&WebSocketServer::accept_loop, this);
+    if(!winsock_ready_) return false;
+    listen_socket_=socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(listen_socket_==INVALID_SOCKET) return false;
+    const BOOL exclusive=TRUE;
+    setsockopt(listen_socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+    sockaddr_in addr{};
+    addr.sin_family=AF_INET; addr.sin_port=htons(port); addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    if(bind(listen_socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))==SOCKET_ERROR ||
+        listen(listen_socket_, SOMAXCONN)==SOCKET_ERROR) {
+        closesocket(listen_socket_); listen_socket_=INVALID_SOCKET; return false;
+    }
+    running_=true;
+    try { accept_thread_=std::thread(&WebSocketServer::accept_loop,this); }
+    catch(...) { running_=false; closesocket(listen_socket_); listen_socket_=INVALID_SOCKET; throw; }
     return true;
+#else
+    (void)port; return false;
+#endif
 }
 
-void WebSocketServer::stop(){
-    running_ = false;
+void WebSocketServer::stop() {
+    running_=false;
 #ifdef _WIN32
-    if(listen_socket_ != INVALID_SOCKET){ closesocket(listen_socket_); listen_socket_ = INVALID_SOCKET; }
+    // Wake blocking reads, but let each owner close its socket after it stops
+    // using it. Closing and reusing a SOCKET during recv races a new connection.
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
-        close_client_locked();
+        if(client_socket_!=INVALID_SOCKET) shutdown(client_socket_,SD_BOTH);
+        if(handshake_socket_!=INVALID_SOCKET) shutdown(handshake_socket_,SD_BOTH);
     }
 #endif
     if(accept_thread_.joinable()) accept_thread_.join();
     if(client_thread_.joinable()) client_thread_.join();
+#ifdef _WIN32
+    if(listen_socket_!=INVALID_SOCKET) { closesocket(listen_socket_); listen_socket_=INVALID_SOCKET; }
+#endif
 }
 
 #ifdef _WIN32
-void WebSocketServer::close_client_locked(){
-    if(client_socket_ != INVALID_SOCKET){ closesocket(client_socket_); client_socket_ = INVALID_SOCKET; }
-}
-#endif
+namespace {
+using Clock=std::chrono::steady_clock;
 
-bool WebSocketServer::perform_handshake(SOCKET s, const std::string& http_request){
-    std::string lower = http_request; for(char& c : lower){ if(c>='A'&&c<='Z') c = char(c - 'A' + 'a'); }
-    const std::string keyHdr = "sec-websocket-key:";
-    auto pos = lower.find(keyHdr);
-    if(pos==std::string::npos) return false;
-    size_t colon = http_request.find(':', pos);
-    if(colon==std::string::npos) return false;
-    size_t lineEnd = http_request.find("\r\n", colon);
-    if(lineEnd==std::string::npos) lineEnd = http_request.size();
-    std::string key = http_request.substr(colon+1, lineEnd - (colon+1));
-    size_t start = key.find_first_not_of(" \t"); size_t stop = key.find_last_not_of(" \t");
-    if(start==std::string::npos) return false; key = key.substr(start, stop-start+1);
-    const std::string magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    std::string accept_key = sha1_base64(magic);
-    std::string resp =
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: " + accept_key + "\r\n\r\n";
-    static const bool kWsDebug = false;
-    int n = send(s, resp.c_str(), (int)resp.size(), 0);
-    if(kWsDebug){ std::cerr << "ws: handshake resp bytes=" << n << std::endl; }
+bool send_all(SOCKET s, const std::string& data) {
+    size_t sent=0;
+    while(sent<data.size()) {
+        const int n=send(s,data.data()+sent,static_cast<int>(data.size()-sent),0);
+        if(n<=0) return false;
+        sent+=n;
+    }
     return true;
 }
+std::string lower(std::string text) {
+    for(char& c:text) if(c>='A' && c<='Z') c=static_cast<char>(c-'A'+'a');
+    return text;
+}
+std::string trim(std::string text) {
+    const auto first=text.find_first_not_of(" \t"), last=text.find_last_not_of(" \t");
+    return first==std::string::npos ? "" : text.substr(first,last-first+1);
+}
+bool has_token(const std::string& text, std::string_view wanted) {
+    size_t pos=0;
+    do {
+        auto end=text.find(',',pos);
+        if(trim(lower(text.substr(pos,end-pos)))==wanted) return true;
+        if(end==std::string::npos) return false;
+        pos=end+1;
+    } while(pos<text.size());
+    return false;
+}
+bool extension_origin(const std::string& origin) {
+    const std::string prefix="chrome-extension://";
+    return origin.size()==prefix.size()+32 && origin.compare(0,prefix.size(),prefix)==0 &&
+        std::all_of(origin.begin()+prefix.size(),origin.end(),[](char c){ return c>='a' && c<='p'; });
+}
+bool valid_key(const std::string& key) {
+    if(key.size()!=24 || key.substr(22)!="==") return false;
+    const std::string b64="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for(size_t i=0;i<22;++i) if(b64.find(key[i])==std::string::npos) return false;
+    return b64.find(key[21])%16==0; // A canonical base64 encoding of 16 bytes.
+}
+bool valid_close(const std::string& payload) {
+    if(payload.empty()) return true;
+    if(payload.size()==1) return false;
+    unsigned code=(static_cast<unsigned char>(payload[0])<<8)|static_cast<unsigned char>(payload[1]);
+    const bool valid=(code>=3000 && code<=4999) || (code>=1000 && code<=1014 && code!=1004 && code!=1005 && code!=1006);
+    return valid && valid_utf8(std::string_view(payload).substr(2));
+}
+}
 
-void WebSocketServer::accept_loop(){
-#ifdef _WIN32
-    while(running_){
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(listen_socket_, &rfds);
-        timeval tv{0, 200*1000};
-        int r = select(0, &rfds, nullptr, nullptr, &tv);
-        if(r>0 && FD_ISSET(listen_socket_, &rfds)){
-            SOCKET s = accept(listen_socket_, nullptr, nullptr);
-            if(s!=INVALID_SOCKET){
-                static const bool kWsDebug = false;
-                if(kWsDebug){ std::cerr << "ws: accept" << std::endl; }
-                // make client socket blocking
-                u_long nb0 = 0; ioctlsocket(s, FIONBIO, &nb0);
-                // read HTTP request headers fully until CRLF CRLF
-                std::string req; req.reserve(2048);
-                char buf[1024];
-                for(;;){
-                    int n = recv(s, buf, sizeof(buf), 0);
-                    if(n<=0) break;
-                    req.append(buf, n);
-                    if(req.find("\r\n\r\n") != std::string::npos) break;
-                    if(req.size() > 16384) break; // sanity cap
-                }
-                if(kWsDebug){ std::cerr << "ws: received headers bytes=" << req.size() << std::endl; }
-                if(!req.empty() && perform_handshake(s, req)){
-                    if(kWsDebug){ std::cerr << "ws: handshake ok" << std::endl; }
-                    {
-                        std::lock_guard<std::mutex> lock(client_mutex_);
-                        close_client_locked();
-                    }
-                    if(client_thread_.joinable()) client_thread_.join();
-                    {
-                        std::lock_guard<std::mutex> lock(client_mutex_);
-                        client_socket_ = s;
-                    }
-                    client_thread_ = std::thread(&WebSocketServer::client_loop, this, s);
-                } else {
-                    if(kWsDebug){ std::cerr << "ws: handshake failed" << std::endl; }
-                    closesocket(s);
-                }
+bool WebSocketServer::perform_handshake(SOCKET s,const std::string& request) {
+    const size_t firstEnd=request.find("\r\n");
+    if(firstEnd==std::string::npos || request.substr(0,firstEnd)!="GET / HTTP/1.1") return false;
+    std::unordered_map<std::string,std::string> headers;
+    for(size_t pos=firstEnd+2; pos<request.size();) {
+        size_t end=request.find("\r\n",pos);
+        if(end==std::string::npos) return false;
+        if(end==pos) break;
+        size_t colon=request.find(':',pos);
+        if(colon==std::string::npos || colon>=end) return false;
+        std::string name=lower(request.substr(pos,colon-pos));
+        if(name.empty() || name.find_first_of(" \t")!=std::string::npos) return false;
+        if(!headers.emplace(name,trim(request.substr(colon+1,end-colon-1))).second) return false;
+        pos=end+2;
+    }
+    if(!extension_origin(headers["origin"]) || lower(headers["upgrade"])!="websocket" ||
+       !has_token(headers["connection"],"upgrade") || headers["sec-websocket-version"]!="13" ||
+       !valid_key(headers["sec-websocket-key"])) return false;
+    // Validate the actual bound port, including ephemeral ports used by tests.
+    sockaddr_in addr{}; int length=sizeof(addr);
+    if(getsockname(s,reinterpret_cast<sockaddr*>(&addr),&length)!=0) return false;
+    const std::string port=":"+std::to_string(ntohs(addr.sin_port));
+    if(headers["host"]!="127.0.0.1"+port && headers["host"]!="localhost"+port) return false;
+    const std::string response="HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+
+        sha1_base64(headers["sec-websocket-key"]+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")+"\r\n\r\n";
+    return send_all(s,response);
+}
+
+void WebSocketServer::accept_loop() {
+    while(running_) {
+        fd_set ready; FD_ZERO(&ready); FD_SET(listen_socket_,&ready);
+        timeval timeout{0,100000};
+        int result=select(0,&ready,nullptr,nullptr,&timeout);
+        if(result<=0 || !running_) continue;
+        SOCKET s=accept(listen_socket_,nullptr,nullptr);
+        if(s==INVALID_SOCKET) continue;
+        {
+            std::lock_guard<std::mutex> lock(client_mutex_);
+            if(!running_) { closesocket(s); break; }
+            handshake_socket_=s;
+        }
+        DWORD ioTimeout=1000;
+        setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&ioTimeout),sizeof(ioTimeout));
+        setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<const char*>(&ioTimeout),sizeof(ioTimeout));
+        const BOOL noDelay=TRUE;
+        setsockopt(s,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&noDelay),sizeof(noDelay));
+        std::string request;
+        size_t headerEnd=std::string::npos;
+        const auto deadline=Clock::now()+std::chrono::seconds(3);
+        while(running_ && request.size()<16384 && Clock::now()<deadline) {
+            char buffer[2048];
+            int n=recv(s,buffer,static_cast<int>(std::min<size_t>(sizeof(buffer),16384-request.size())),0);
+            if(n<=0) break;
+            request.append(buffer,n);
+            headerEnd=request.find("\r\n\r\n");
+            if(headerEnd!=std::string::npos) break;
+        }
+        bool accepted=running_ && headerEnd!=std::string::npos && perform_handshake(s,request.substr(0,headerEnd+4));
+        if(accepted) {
+            {
+                std::lock_guard<std::mutex> lock(client_mutex_);
+                if(client_socket_!=INVALID_SOCKET) shutdown(client_socket_,SD_BOTH);
             }
+            if(client_thread_.joinable()) client_thread_.join();
         }
-    }
-#endif
-}
-
-static bool ws_read_frame(SOCKET s, std::string& out_text){
-    std::string message_accum;
-    uint8_t current_opcode = 0;
-    bool in_fragmented = false;
-    for(;;){
-        uint8_t hdr[2]; int n = recv(s, reinterpret_cast<char*>(hdr), 2, 0); if(n!=2) return false;
-        bool fin = (hdr[0] & 0x80)!=0; uint8_t opcode = hdr[0] & 0x0F; bool masked = (hdr[1] & 0x80)!=0; uint64_t len = hdr[1] & 0x7F;
-        if(len==126){ uint8_t ext[2]; if(recv(s, reinterpret_cast<char*>(ext), 2, 0)!=2) return false; len = (ext[0]<<8)|ext[1]; }
-        else if(len==127){ uint8_t ext[8]; if(recv(s, reinterpret_cast<char*>(ext), 8, 0)!=8) return false; len = 0; for(int i=0;i<8;++i){ len = (len<<8)|ext[i]; } }
-        uint8_t mask[4]{}; if(masked){ if(recv(s, reinterpret_cast<char*>(mask), 4, 0)!=4) return false; }
-        std::string payload; payload.resize(static_cast<size_t>(len));
-        size_t got=0; while(got<len){ int m = recv(s, payload.data()+got, (int)(len-got), 0); if(m<=0) return false; got += m; }
-        if(masked){ for(size_t i=0;i<len;++i){ payload[i] = payload[i] ^ mask[i%4]; } }
-        // contorl opcodes
-        if(opcode==0x8){ // close
-            return false;
-        } else if(opcode==0x9){ // ping -> reply pong
-            uint8_t pong_hdr[2]; pong_hdr[0] = 0x80 | 0x0A; // FIN + pong
-            if(len<126){ pong_hdr[1] = (uint8_t)len; send(s, reinterpret_cast<const char*>(pong_hdr), 2, 0); }
-            else if(len<=0xFFFF){ pong_hdr[1] = 126; send(s, reinterpret_cast<const char*>(pong_hdr), 2, 0); uint8_t ext2[2]{ (uint8_t)((len>>8)&0xFF), (uint8_t)(len&0xFF) }; send(s, reinterpret_cast<const char*>(ext2), 2, 0); }
-            else { pong_hdr[1] = 127; send(s, reinterpret_cast<const char*>(pong_hdr), 2, 0); uint8_t ext2[8]; for(int i=7;i>=0;--i){ ext2[7-i] = (uint8_t)((len>>(i*8))&0xFF); } send(s, reinterpret_cast<const char*>(ext2), 8, 0); }
-            if(len>0) send(s, payload.data(), (int)len, 0);
-            continue;
-        } else if(opcode==0xA){ // pong
-            continue;
+        {
+            std::lock_guard<std::mutex> lock(client_mutex_);
+            handshake_socket_=INVALID_SOCKET;
+            if(!accepted || !running_) { closesocket(s); continue; }
+            client_socket_=s;
         }
-        // data opcodes: handle fragmentation
-        if(opcode==0x1 && !in_fragmented){ // start text
-            current_opcode = opcode; message_accum = std::move(payload); in_fragmented = !fin;
-            if(fin){ out_text = std::move(message_accum); return true; }
-        } else if(opcode==0x0 && in_fragmented){ // continuation
-            message_accum += payload; if(fin){ out_text = std::move(message_accum); return true; }
-        } else if(opcode==0x2 || (opcode==0x0 && !in_fragmented)){
-            // ignore binary frames and unexpected continuation
-            continue;
-        } else if(opcode==0x1 && in_fragmented){
-            // unexpected new text while fragmented; reset state and treat as new
-            message_accum.clear(); in_fragmented=false; current_opcode=0; message_accum = std::move(payload); if(fin){ out_text = std::move(message_accum); return true; } else { in_fragmented=true; current_opcode=0x1; }
-        }
+        notify_connection(true);
+        client_thread_=std::thread(&WebSocketServer::client_loop,this,s,request.substr(headerEnd+4));
     }
 }
 
-void WebSocketServer::client_loop(SOCKET s){
-#ifdef _WIN32
-    for(;;){
-        std::string text; if(!ws_read_frame(s, text)) break;
-        if(on_message_) on_message_(WsMessage{std::move(text)});
+bool WebSocketServer::send_frame(SOCKET s,uint8_t opcode,const std::string& data) {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    std::string frame;
+    const uint64_t length=data.size();
+    frame.reserve(data.size()+10);
+    frame.push_back(static_cast<char>(0x80|opcode));
+    if(length<126) frame.push_back(static_cast<char>(length));
+    else if(length<=65535) {
+        frame.push_back(126); frame.push_back(static_cast<char>(length>>8)); frame.push_back(static_cast<char>(length));
+    } else {
+        frame.push_back(127);
+        for(int i=7;i>=0;--i) frame.push_back(static_cast<char>(length>>(i*8)));
+    }
+    frame+=data;
+    return send_all(s,frame);
+}
+
+bool WebSocketServer::read_message(SOCKET s,std::string& buffered,std::string& text) {
+    text.clear();
+    bool fragmented=false;
+    auto deadline=Clock::time_point::max();
+    auto read_exact = [&](char* dst,size_t size) {
+        size_t got=0;
+        while(got<size && running_) {
+            if(Clock::now()>=deadline) return false;
+            size_t available=std::min(size-got,buffered.size());
+            if(available>0) {
+                std::memcpy(dst+got,buffered.data(),available);
+                buffered.erase(0,available); got+=available;
+            } else {
+                int n=recv(s,dst+got,static_cast<int>(size-got),0);
+                if(n==SOCKET_ERROR && WSAGetLastError()==WSAETIMEDOUT) continue;
+                if(n<=0) return false;
+                got+=n;
+            }
+            if(deadline==Clock::time_point::max()) deadline=Clock::now()+std::chrono::seconds(5);
+        }
+        return got==size;
+    };
+    auto fail = [&](unsigned code) {
+        send_frame(s,8,std::string{static_cast<char>(code>>8),static_cast<char>(code)});
+        return false;
+    };
+    for(;;) {
+        uint8_t header[2];
+        if(!read_exact(reinterpret_cast<char*>(header),2)) return false;
+        bool fin=(header[0]&0x80)!=0;
+        const uint8_t opcode=header[0]&15;
+        const bool control=(opcode&8)!=0;
+        uint64_t length=header[1]&127;
+        if((header[0]&0x70)!=0 || !(header[1]&0x80) ||
+           (opcode!=0 && opcode!=1 && opcode!=8 && opcode!=9 && opcode!=10) ||
+           (control && (!fin || length>125))) return fail(1002);
+        const unsigned marker=static_cast<unsigned>(length);
+        if(marker==126 || marker==127) {
+            uint8_t ext[8]{};
+            const size_t bytes=marker==126 ? 2 : 8;
+            if(!read_exact(reinterpret_cast<char*>(ext),bytes)) return false;
+            if(bytes==8 && (ext[0]&0x80)) return fail(1002);
+            length=0; for(size_t i=0;i<bytes;++i) length=(length<<8)|ext[i];
+            if((marker==126 && length<126) || (marker==127 && length<=65535)) return fail(1002);
+        }
+        if(length>proto::MaxMessageBytes || (!control && length>proto::MaxMessageBytes-text.size())) return fail(1009);
+        if(!control && ((opcode==0 && !fragmented) || (opcode==1 && fragmented))) return fail(1002);
+        uint8_t mask[4];
+        if(!read_exact(reinterpret_cast<char*>(mask),4)) return false;
+        std::string payload(static_cast<size_t>(length),'\0');
+        if(!read_exact(payload.data(),payload.size())) return false;
+        for(size_t i=0;i<payload.size();++i) payload[i]^=mask[i%4];
+        if(opcode==8) {
+            if(!valid_close(payload)) return fail(1002);
+            send_frame(s,8,payload); return false;
+        }
+        if(opcode==9 || opcode==10) {
+            if(opcode==9 && !send_frame(s,10,payload)) return false;
+            if(!fragmented) deadline=Clock::time_point::max();
+            continue;
+        }
+        text+=payload;
+        fragmented=!fin;
+        if(fin) return valid_utf8(text) ? true : fail(1007);
+    }
+}
+
+void WebSocketServer::client_loop(SOCKET s,std::string buffered) {
+    try {
+        while(running_) {
+            std::string text;
+            if(!read_message(s,buffered,text)) break;
+            MessageCallback cb;
+            { std::lock_guard<std::mutex> lock(callback_mutex_); cb=on_message_; }
+            if(cb && running_) cb(WsMessage{std::move(text)});
+        }
+    } catch(const std::exception& e) {
+        std::cerr<<"WebSocket client: "<<e.what()<<'\n';
     }
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
-        if(client_socket_ == s){
-            closesocket(s);
-            client_socket_ = INVALID_SOCKET;
-        }
+        closesocket(s);
+        if(client_socket_==s) client_socket_=INVALID_SOCKET;
     }
-#endif
+    notify_connection(false);
 }
-
-bool WebSocketServer::send_text(const std::string& data){
-#ifdef _WIN32
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    if(client_socket_==INVALID_SOCKET) return false;
-    std::string frame;
-    frame.push_back((char)0x81);
-    size_t len = data.size();
-    if(len<126){ frame.push_back((char)len); }
-    else if(len<=0xFFFF){ frame.push_back(126); frame.push_back((char)((len>>8)&0xFF)); frame.push_back((char)(len&0xFF)); }
-    else { frame.push_back(127); for(int i=7;i>=0;--i) frame.push_back((char)((len>>(i*8))&0xFF)); }
-    frame += data;
-    int n = send(client_socket_, frame.c_str(), (int)frame.size(), 0);
-    return n==(int)frame.size();
 #else
-    return false;
+void WebSocketServer::accept_loop() {}
+#endif
+
+bool WebSocketServer::send_text(const std::string& data) {
+#ifdef _WIN32
+    if(data.size()>proto::MaxMessageBytes || !valid_utf8(data)) return false;
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    return client_socket_!=INVALID_SOCKET && send_frame(client_socket_,1,data);
+#else
+    (void)data; return false;
 #endif
 }
-}
+} // namespace net

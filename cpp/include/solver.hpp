@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <functional>
 
 #include "board.hpp"
 
@@ -24,9 +25,8 @@ struct Overlay {
 	std::vector<double> mineProbability;
 };
 
-Overlay compute_overlay(const game::Board& board, int totalMines=-1, bool enableChords=true, int threads=0);
+// The cancellation callback may be called concurrently by solver workers.
+Overlay compute_overlay(const game::Board& board, int totalMines=-1, bool enableChords=true, int threads=0,
+    const std::function<bool()>& isCancelled = {});
 
 }
-
-
-

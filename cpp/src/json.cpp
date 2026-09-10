@@ -1,162 +1,227 @@
-#include <string>
-#include <vector>
-#include <cctype>
-#include <climits>
-
 #include "proto.hpp"
+#include "utf8.hpp"
+
+#include <charconv>
+#include <cmath>
+#include <string_view>
+#include <unordered_set>
+#include <utility>
 
 namespace proto {
+namespace {
 
-static void skip_ws(const std::string& s, size_t& i){ while(i<s.size() && std::isspace((unsigned char)s[i])) ++i; }
-static bool match(const std::string& s, size_t& i, char c){ skip_ws(s,i); if(i<s.size() && s[i]==c){ ++i; return true; } return false; }
-static bool parse_string(const std::string& s, size_t& i, std::string& out){ skip_ws(s,i); if(i>=s.size()||s[i]!='"') return false; ++i; out.clear(); while(i<s.size()&&s[i]!='"'){ if(s[i]=='\\' && i+1<s.size()){ ++i; out.push_back(s[i++]); } else { out.push_back(s[i++]); } } if(i>=s.size()) return false; ++i; return true; }
-static bool parse_int(const std::string& s, size_t& i, int& out){
-    skip_ws(s,i); bool neg=false;
-    if(i<s.size()&&(s[i]=='-'||s[i]=='+')){ neg=s[i]=='-'; ++i; }
-    int v=0; bool any=false;
-    while(i<s.size() && std::isdigit((unsigned char)s[i])){
-        any=true;
-        int digit = s[i] - '0';
-        if(v > (INT_MAX - digit) / 10){ while(i<s.size() && std::isdigit((unsigned char)s[i])) ++i; out = neg ? INT_MIN : INT_MAX; return true; }
-        v = v*10 + digit; ++i;
+class Reader {
+public:
+    explicit Reader(std::string_view text) : text_(text) {}
+    void whitespace() {
+        while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\t' || text_[pos_] == '\r' || text_[pos_] == '\n')) ++pos_;
     }
-    if(!any) return false; out = neg?-v:v; return true;
-}
-static bool parse_double(const std::string& s, size_t& i, double& out){
-    skip_ws(s,i);
-    size_t start=i;
-    if(i<s.size() && (s[i]=='-'||s[i]=='+')) ++i;
-    bool any=false; while(i<s.size() && std::isdigit((unsigned char)s[i])){ any=true; ++i; }
-    if(i<s.size() && s[i]=='.'){ ++i; while(i<s.size() && std::isdigit((unsigned char)s[i])){ any=true; ++i; } }
-    if(i<s.size() && (s[i]=='e'||s[i]=='E')){ ++i; if(i<s.size() && (s[i]=='+'||s[i]=='-')) ++i; while(i<s.size() && std::isdigit((unsigned char)s[i])) ++i; }
-    if(!any) return false;
-    try { out = std::stod(s.substr(start, i-start)); } catch(...) { return false; }
+    bool take(char c) {
+        whitespace();
+        if (pos_ == text_.size() || text_[pos_] != c) return false;
+        ++pos_; return true;
+    }
+    bool finished() { whitespace(); return pos_ == text_.size(); }
+    bool string(std::string& out) {
+        if (!take('"')) return false;
+        out.clear();
+        while (pos_ < text_.size()) {
+            char c = text_[pos_++];
+            if (c == '"') return true;
+            if (static_cast<unsigned char>(c) < 0x20) return false;
+            if (c != '\\') { out.push_back(c); continue; }
+            if (pos_ == text_.size()) return false;
+            c = text_[pos_++];
+            switch (c) {
+            case '"': case '\\': case '/': out.push_back(c); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp;
+                if (!hex4(cp)) return false;
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (text_.substr(pos_, 2) != "\\u") return false;
+                    pos_ += 2;
+                    uint32_t low;
+                    if (!hex4(low) || low < 0xdc00 || low > 0xdfff) return false;
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) return false;
+                if (cp < 0x80) out.push_back(static_cast<char>(cp));
+                else {
+                    if (cp >= 0x10000) out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+                    if (cp >= 0x800) out.push_back(static_cast<char>((cp >= 0x10000 ? 0x80 : 0xe0) | ((cp >> 12) & 0x3f)));
+                    out.push_back(static_cast<char>((cp >= 0x800 ? 0x80 : 0xc0) | ((cp >> 6) & 0x3f)));
+                    out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+                }
+                break;
+            }
+            default: return false;
+            }
+        }
+        return false;
+    }
+    bool integer(int& out) {
+        std::string_view token;
+        if (!number_token(token) || token.find_first_of(".eE") != std::string_view::npos) return false;
+        const auto result = std::from_chars(token.data(), token.data() + token.size(), out);
+        return result.ec == std::errc{} && result.ptr == token.data() + token.size();
+    }
+    bool number(double& out) {
+        std::string_view token;
+        if (!number_token(token)) return false;
+        const auto result = std::from_chars(token.data(), token.data() + token.size(), out);
+        return result.ec == std::errc{} && result.ptr == token.data() + token.size() && std::isfinite(out);
+    }
+    template<class Field> bool object(Field field) {
+        if (!take('{')) return false;
+        if (take('}')) return true;
+        std::unordered_set<std::string> keys;
+        do {
+            std::string key;
+            if (!string(key) || !keys.insert(key).second || !take(':') || !field(key)) return false;
+            if (take('}')) return true;
+        } while (take(','));
+        return false;
+    }
+    template<class Item> bool array(Item item) {
+        if (!take('[')) return false;
+        if (take(']')) return true;
+        do {
+            if (!item()) return false;
+            if (take(']')) return true;
+        } while (take(','));
+        return false;
+    }
+    bool skip(int depth = 0) {
+        if (depth >= 32) return false;
+        whitespace();
+        if (pos_ == text_.size()) return false;
+        if (text_[pos_] == '{') return object([&](const auto&) { return skip(depth + 1); });
+        if (text_[pos_] == '[') return array([&] { return skip(depth + 1); });
+        if (text_[pos_] == '"') { std::string unused; return string(unused); }
+        for (std::string_view literal : {"true", "false", "null"}) {
+            if (text_.substr(pos_, literal.size()) == literal) { pos_ += literal.size(); return true; }
+        }
+        double unused; return number(unused);
+    }
+private:
+    bool hex4(uint32_t& value) {
+        value = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (pos_ == text_.size()) return false;
+            const char c = text_[pos_++];
+            int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (digit < 0) return false;
+            value = value * 16 + digit;
+        }
+        return true;
+    }
+    bool number_token(std::string_view& out) {
+        whitespace(); const size_t start = pos_;
+        if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
+        auto digit = [&] { return pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9'; };
+        if (!digit()) return false;
+        if (text_[pos_] == '0') { ++pos_; if (digit()) return false; }
+        else while (digit()) ++pos_;
+        if (pos_ < text_.size() && text_[pos_] == '.') {
+            ++pos_; if (!digit()) return false; while (digit()) ++pos_;
+        }
+        if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
+            ++pos_;
+            if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+            if (!digit()) return false;
+            while (digit()) ++pos_;
+        }
+        out = text_.substr(start, pos_ - start); return true;
+    }
+    std::string_view text_;
+    size_t pos_ = 0;
+};
+
+} // namespace
+
+bool parse_message(const std::string& json, ParsedMessage& out) {
+    out = {};
+    if (json.size() > MaxMessageBytes || !valid_utf8(json)) return false;
+    Reader r(json);
+    ParsedMessage parsed;
+    GeometryMsg geometry;
+    std::string type;
+    bool gotW = false, gotH = false, gotCells = false, gotUpdates = false, gotPid = false;
+    unsigned rectKeys = 0;
+    const bool ok = r.object([&](const std::string& key) {
+        if (key == "type") return r.string(type);
+        if (key == "w") { gotW = true; return r.integer(parsed.full.w); }
+        if (key == "h") { gotH = true; return r.integer(parsed.full.h); }
+        if (key == "pid") { gotPid = true; return r.integer(parsed.bind.pid) && parsed.bind.pid > 0; }
+        if (key == "cells") {
+            gotCells = true;
+            return r.array([&] {
+                int state;
+                if (parsed.full.cells.size() >= game::MaxBoardCells || !r.integer(state) || !game::valid_cell_state(state)) return false;
+                parsed.full.cells.push_back(static_cast<game::CellState>(state)); return true;
+            });
+        }
+        if (key == "updates") {
+            gotUpdates = true;
+            return r.array([&] {
+                if (parsed.delta.updates.size() >= game::MaxBoardCells) return false;
+                game::CellUpdate update{};
+                unsigned fields = 0;
+                if (!r.object([&](const std::string& k) {
+                    if (k == "x") { fields |= 1; return r.integer(update.x); }
+                    if (k == "y") { fields |= 2; return r.integer(update.y); }
+                    if (k == "s") {
+                        int state; fields |= 4;
+                        if (!r.integer(state) || !game::valid_cell_state(state)) return false;
+                        update.state = static_cast<game::CellState>(state); return true;
+                    }
+                    return r.skip();
+                }) || fields != 7 || update.x < 0 || update.y < 0 || update.x >= game::MaxBoardDimension || update.y >= game::MaxBoardDimension) return false;
+                parsed.delta.updates.push_back(update); return true;
+            });
+        }
+        if (key == "mines_total") {
+            geometry.has_mines_total = true;
+            return r.integer(geometry.mines_total) && geometry.mines_total >= -1 && geometry.mines_total <= game::MaxBoardCells;
+        }
+        if (key == "cell_px") return r.integer(geometry.cell_px) && geometry.cell_px >= 0 && geometry.cell_px <= 16384;
+        if (key == "ox") return r.integer(geometry.origin_x);
+        if (key == "oy") return r.integer(geometry.origin_y);
+        double* value = nullptr;
+        if (key == "rect_l") { value = &geometry.rect_l; rectKeys |= 1; }
+        else if (key == "rect_t") { value = &geometry.rect_t; rectKeys |= 2; }
+        else if (key == "rect_w") { value = &geometry.rect_w; rectKeys |= 4; }
+        else if (key == "rect_h") { value = &geometry.rect_h; rectKeys |= 8; }
+        else if (key == "vv_x") value = &geometry.vv_x;
+        else if (key == "vv_y") value = &geometry.vv_y;
+        else if (key == "vv_scale") value = &geometry.vv_scale;
+        else if (key == "dpr") value = &geometry.dpr;
+        if (!value) return r.skip();
+        return r.number(*value) && std::abs(*value) <= 1000000;
+    });
+    if (!ok || !r.finished() || (rectKeys != 0 && rectKeys != 15) ||
+        geometry.rect_w < 0 || geometry.rect_h < 0 || geometry.rect_w > 16384 || geometry.rect_h > 16384 ||
+        geometry.vv_scale <= 0 || geometry.vv_scale > 16 || geometry.dpr <= 0 || geometry.dpr > 16) return false;
+    geometry.has_geometry = rectKeys == 15;
+    if (type == "full") {
+        if (!gotW || !gotH || !gotCells || !game::valid_dimensions(parsed.full.w, parsed.full.h) ||
+            parsed.full.cells.size() != static_cast<size_t>(parsed.full.w) * parsed.full.h) return false;
+        parsed.type = MsgType::Full;
+        static_cast<GeometryMsg&>(parsed.full) = geometry;
+    } else if (type == "delta") {
+        if (!gotUpdates) return false;
+        parsed.type = MsgType::Delta;
+        static_cast<GeometryMsg&>(parsed.delta) = geometry;
+    } else if (type == "bind") {
+        if (!gotPid) return false;
+        parsed.type = MsgType::Bind;
+    } else return false;
+    out = std::move(parsed);
     return true;
 }
 
-static bool parse_object_start(const std::string& s, size_t& i){ return match(s,i,'{'); }
-static bool parse_object_end(const std::string& s, size_t& i){ return match(s,i,'}'); }
-static bool parse_array_start(const std::string& s, size_t& i){ return match(s,i,'['); }
-static bool parse_array_end(const std::string& s, size_t& i){ return match(s,i,']'); }
-static bool parse_colon(const std::string& s, size_t& i){ return match(s,i,':'); }
-static bool parse_comma(const std::string& s, size_t& i){ return match(s,i,','); }
-
-static bool skip_value(const std::string& s, size_t& i){
-    skip_ws(s,i);
-    if(i>=s.size()) return false;
-    char c = s[i];
-    if(c=='"'){ std::string tmp; return parse_string(s,i,tmp); }
-    if(c=='{'){ ++i; skip_ws(s,i); if(i<s.size() && s[i]=='}'){ ++i; return true; }
-        for(;;){ std::string key; if(!parse_string(s,i,key)) return false; if(!parse_colon(s,i)) return false; if(!skip_value(s,i)) return false;
-            size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_object_end(s,i)) break; else return false; } return true; }
-    if(c=='['){ ++i; skip_ws(s,i); if(i<s.size() && s[i]==']'){ ++i; return true; }
-        for(;;){ if(!skip_value(s,i)) return false;
-            size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_array_end(s,i)) break; else return false; } return true; }
-    if(c=='t'){ if(i+4<=s.size() && s.compare(i,4,"true")==0){ i+=4; return true; } return false; }
-    if(c=='f'){ if(i+5<=s.size() && s.compare(i,5,"false")==0){ i+=5; return true; } return false; }
-    if(c=='n'){ if(i+4<=s.size() && s.compare(i,4,"null")==0){ i+=4; return true; } return false; }
-    if(c=='-' || std::isdigit((unsigned char)c)){ double d; return parse_double(s,i,d); }
-    return false;
-}
-
-using proto::GeometryMsg; using proto::FullMsg; using proto::DeltaMsg; using proto::ParsedMessage; using proto::MsgType; using proto::BindMsg;
-
-static bool parse_cells_array(const std::string& s, size_t& i, std::vector<game::CellState>& out){
-    if(!parse_array_start(s,i)) return false; out.clear();
-    size_t j=i; skip_ws(s,j); if(j<s.size() && s[j]==']'){ i=j+1; return true; }
-    for(;;){ int v; if(!parse_int(s,i,v)) return false; out.push_back(static_cast<game::CellState>(v)); size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_array_end(s,i)) break; else return false; }
-    return true;
-}
-
-static bool parse_updates_array(const std::string& s, size_t& i, std::vector<game::CellUpdate>& out){
-    if(!parse_array_start(s,i)) return false; out.clear();
-    size_t j=i; skip_ws(s,j); if(j<s.size() && s[j]==']'){ i=j+1; return true; }
-    for(;;){ if(!parse_object_start(s,i)) return false; int x=0,y=0,sv=0; bool gotx=false, goty=false, gots=false; for(;;){ std::string key; if(!parse_string(s,i,key)) return false; if(!parse_colon(s,i)) return false; if(key=="x"){ if(!parse_int(s,i,x)) return false; gotx=true; } else if(key=="y"){ if(!parse_int(s,i,y)) return false; goty=true; } else if(key=="s"){ if(!parse_int(s,i,sv)) return false; gots=true; } else { return false; } size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_object_end(s,i)) break; else return false; } if(!(gotx&&goty&&gots)) return false; out.push_back(game::CellUpdate{x,y,static_cast<game::CellState>(sv)}); size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_array_end(s,i)) break; else return false; }
-    return true;
-}
-
-static bool try_parse_geometry_key(const std::string& s, size_t& i, const std::string& key, GeometryMsg& g){
-    if(key=="cell_px") return parse_int(s,i,g.cell_px);
-    if(key=="ox") return parse_int(s,i,g.origin_x);
-    if(key=="oy") return parse_int(s,i,g.origin_y);
-    if(key=="mines_total") return parse_int(s,i,g.mines_total);
-    if(key=="rect_l") return parse_double(s,i,g.rect_l);
-    if(key=="rect_t") return parse_double(s,i,g.rect_t);
-    if(key=="rect_w") return parse_double(s,i,g.rect_w);
-    if(key=="rect_h") return parse_double(s,i,g.rect_h);
-    if(key=="vv_x") return parse_double(s,i,g.vv_x);
-    if(key=="vv_y") return parse_double(s,i,g.vv_y);
-    if(key=="vv_scale") return parse_double(s,i,g.vv_scale);
-    if(key=="dpr") return parse_double(s,i,g.dpr);
-    return false;
-}
-
-static bool parse_full(const std::string& s, size_t& i, FullMsg& out){
-    if(!parse_object_start(s,i)) return false;
-    bool gotw=false,goth=false,gotcells=false;
-    for(;;){
-        std::string key; if(!parse_string(s,i,key)) return false; if(!parse_colon(s,i)) return false;
-        if(key=="w"){ if(!parse_int(s,i,out.w)) return false; gotw=true; }
-        else if(key=="h"){ if(!parse_int(s,i,out.h)) return false; goth=true; }
-        else if(key=="cells"){ if(!parse_cells_array(s,i,out.cells)) return false; gotcells=true; }
-        else if(!try_parse_geometry_key(s,i,key,out)){ if(!skip_value(s,i)) return false; }
-        size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_object_end(s,i)) break; else return false;
-    }
-    return gotw&&goth&&gotcells;
-}
-
-static bool parse_delta(const std::string& s, size_t& i, DeltaMsg& out){
-    if(!parse_object_start(s,i)) return false; bool gotu=false;
-    for(;;){
-        std::string key; if(!parse_string(s,i,key)) return false; if(!parse_colon(s,i)) return false;
-        if(key=="updates"){ if(!parse_updates_array(s,i,out.updates)) return false; gotu=true; }
-        else if(!try_parse_geometry_key(s,i,key,out)){ if(!skip_value(s,i)) return false; }
-        size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_object_end(s,i)) break; else return false;
-    }
-    return gotu;
-}
-
-static bool parse_bind(const std::string& s, size_t& i, BindMsg& out){
-    if(!parse_object_start(s,i)) return false; bool gotp=false;
-    for(;;){
-        std::string key; if(!parse_string(s,i,key)) return false; if(!parse_colon(s,i)) return false;
-        if(key=="pid"){ if(!parse_int(s,i,out.pid)) return false; gotp=true; }
-        else { if(!skip_value(s,i)) return false; }
-        size_t k=i; if(parse_comma(s,k)){ i=k; continue; } if(parse_object_end(s,i)) break; else return false;
-    }
-    return gotp;
-}
-
-static bool find_type_value(const std::string& s, const char* needle){
-    return s.find(needle) != std::string::npos;
-}
-
-static bool parse_root(const std::string& s, ParsedMessage& out){
-    if(find_type_value(s, "\"type\":\"full\"") || find_type_value(s, "\"type\": \"full\"")){
-        size_t r=0; bool ok = parse_full(s,r,out.full); if(ok){ out.type=MsgType::Full; } return ok;
-    }
-    if(find_type_value(s, "\"type\":\"delta\"") || find_type_value(s, "\"type\": \"delta\"")){
-        size_t r=0; bool ok = parse_delta(s,r,out.delta); if(ok){ out.type=MsgType::Delta; } return ok;
-    }
-    if(find_type_value(s, "\"type\":\"bind\"") || find_type_value(s, "\"type\": \"bind\"")){
-        size_t r=0; bool ok = parse_bind(s,r,out.bind); if(ok){ out.type=MsgType::Bind; } return ok;
-    }
-    size_t i=0; if(!parse_object_start(s,i)) return false; std::string type; bool gott=false;
-    size_t j=i; for(;;){
-        std::string key; if(!parse_string(s,j,key)) return false; if(!parse_colon(s,j)) return false;
-        if(key=="type"){ if(!parse_string(s,j,type)) return false; gott=true; }
-        else { if(!skip_value(s,j)) return false; }
-        size_t k=j; if(parse_comma(s,k)){ j=k; continue; } if(parse_object_end(s,j)) break; else return false;
-    }
-    if(!gott) return false;
-    size_t r=0;
-    if(type=="full"){ bool ok = parse_full(s,r,out.full); if(ok){ out.type=MsgType::Full; } return ok; }
-    if(type=="delta"){ bool ok = parse_delta(s,r,out.delta); if(ok){ out.type=MsgType::Delta; } return ok; }
-    if(type=="bind"){ bool ok = parse_bind(s,r,out.bind); if(ok){ out.type=MsgType::Bind; } return ok; }
-    return false;
-}
-
-bool parse_message(const std::string& json, ParsedMessage& out){ return parse_root(json, out); }
-
-}
-
+} // namespace proto

@@ -1,23 +1,43 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(SRC
-    src/main.cpp
-    src/ws_server.cpp
+add_library(tihnt_core
     src/board.cpp
     src/json.cpp
     src/solver.cpp
-    src/overlay.cpp
 )
-
-add_executable(mines_overlay WIN32 ${SRC})
-
-set_target_properties(mines_overlay PROPERTIES OUTPUT_NAME "tihnt")
-
-target_include_directories(mines_overlay PRIVATE include)
+target_include_directories(tihnt_core PUBLIC include)
+find_package(Threads REQUIRED)
+target_link_libraries(tihnt_core PUBLIC Threads::Threads)
 
 if(WIN32)
+  add_executable(mines_overlay WIN32 src/main.cpp src/ws_server.cpp src/overlay.cpp)
+  set_target_properties(mines_overlay PROPERTIES OUTPUT_NAME "tihnt")
   target_compile_definitions(mines_overlay PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_link_libraries(mines_overlay PRIVATE user32 gdi32 ws2_32)
+  target_link_libraries(mines_overlay PRIVATE tihnt_core user32 gdi32 ws2_32 dwmapi)
 endif()
 
-
+if(BUILD_TESTING)
+  add_executable(core_tests tests/core_tests.cpp)
+  target_link_libraries(core_tests PRIVATE tihnt_core)
+  add_test(NAME core COMMAND core_tests)
+  set_tests_properties(core PROPERTIES TIMEOUT 120)
+  if(WIN32)
+    add_executable(overlay_tests tests/overlay_tests.cpp src/overlay.cpp)
+    target_compile_definitions(overlay_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(overlay_tests PRIVATE tihnt_core user32 gdi32 dwmapi)
+    add_test(NAME overlay COMMAND overlay_tests)
+    set_tests_properties(overlay PROPERTIES TIMEOUT 30)
+  endif()
+  find_program(TIHNT_NODE node)
+  if(TIHNT_NODE)
+    add_test(NAME extension COMMAND "${TIHNT_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/../tests/extension.test.cjs")
+    set_tests_properties(extension PROPERTIES TIMEOUT 30)
+    if(WIN32)
+      add_executable(ws_fixture tests/ws_fixture.cpp src/ws_server.cpp)
+      target_compile_definitions(ws_fixture PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+      target_link_libraries(ws_fixture PRIVATE tihnt_core ws2_32)
+      add_test(NAME websocket COMMAND "${TIHNT_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/../tests/websocket.test.cjs")
+      set_tests_properties(websocket PROPERTIES TIMEOUT 60 ENVIRONMENT "TIHNT_WS_FIXTURE=$<TARGET_FILE:ws_fixture>")
+    endif()
+  endif()
+endif()

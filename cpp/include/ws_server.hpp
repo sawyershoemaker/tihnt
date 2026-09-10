@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -21,6 +22,7 @@ struct WsMessage {
 class WebSocketServer {
 public:
     using MessageCallback = std::function<void(const WsMessage&)>;
+    using ConnectionCallback = std::function<void(bool)>;
 
     WebSocketServer();
     ~WebSocketServer();
@@ -29,6 +31,7 @@ public:
     void stop();
 
     void set_on_message(MessageCallback cb);
+    void set_on_connection(ConnectionCallback cb);
     bool send_text(const std::string& data);
 
     bool is_connected() const {
@@ -41,22 +44,31 @@ public:
     }
 
 private:
-    bool running_;
+    std::atomic<bool> running_{false};
     MessageCallback on_message_;
+    ConnectionCallback on_connection_;
+    std::mutex callback_mutex_;
+    std::mutex send_mutex_;
+    void notify_connection(bool connected);
 
 #ifdef _WIN32
     SOCKET listen_socket_ = INVALID_SOCKET;
     SOCKET client_socket_ = INVALID_SOCKET;
+    SOCKET handshake_socket_ = INVALID_SOCKET;
+    bool winsock_ready_ = false;
     mutable std::mutex client_mutex_;
-    void close_client_locked();
+    bool send_frame(SOCKET s, uint8_t opcode, const std::string& data);
+    bool read_message(SOCKET s, std::string& buffered, std::string& text);
 #endif
 
     std::thread accept_thread_;
     std::thread client_thread_;
 
-    bool perform_handshake(SOCKET s, const std::string& http_request);
     void accept_loop();
-    void client_loop(SOCKET s);
+#ifdef _WIN32
+    bool perform_handshake(SOCKET s, const std::string& http_request);
+    void client_loop(SOCKET s, std::string buffered);
+#endif
 };
 
 }

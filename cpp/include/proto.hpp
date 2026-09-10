@@ -6,7 +6,11 @@
 
 namespace proto {
 
+inline constexpr size_t MaxMessageBytes = 1024 * 1024;
+
 struct GeometryMsg {
+    bool has_mines_total = false;
+    bool has_geometry = false;
     int cell_px=0;
     int origin_x=0;
     int origin_y=0;

@@ -1,26 +1,27 @@
 {
   "manifest_version": 3,
+  "minimum_chrome_version": "116",
   "name": "TIHNT",
   "version": "0.0.0.0",
   "version_name": "github.com/sawyershoemaker/tihnt",
   "description": "Tile Information & Hidden Node Toolkit",
   "icons": {
-    "16": "tihnt-16.png",
-    "32": "tihnt-32.png",
-    "48": "tihnt-48.png",
-    "128": "tihnt-128.png",
+    "16": "tihnt-256.png",
+    "32": "tihnt-256.png",
+    "48": "tihnt-256.png",
+    "128": "tihnt-256.png",
     "256": "tihnt-256.png"
   },
   "action": {
     "default_title": "TIHNT",
     "default_icon": {
-      "16": "tihnt-16.png",
-      "32": "tihnt-32.png",
-      "48": "tihnt-48.png",
-      "128": "tihnt-128.png"
+      "16": "tihnt-256.png",
+      "32": "tihnt-256.png",
+      "48": "tihnt-256.png",
+      "128": "tihnt-256.png"
     }
   },
-  "permissions": ["storage", "scripting", "activeTab"],
+  "permissions": ["storage"],
   "host_permissions": ["*://*.minesweeper.online/*"],
   "background": {
     "service_worker": "background.js"
@@ -47,5 +48,3 @@
     }
   }
 }
-
-

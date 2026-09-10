@@ -50,10 +50,14 @@ public:
 #endif
 
 private:
+    friend struct OverlayTestAccess;
 #ifdef _WIN32
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK MouseHook(int, WPARAM, LPARAM);
+    static OverlayWindow* hook_owner_;
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
     void redraw(bool full = true);
+    void paint_surface();
     bool ensureSurface(int w, int h);
     HWND findRenderHost();
     void hide();
@@ -67,6 +71,11 @@ private:
     int surf_h_ = 0;
     unsigned char* bits_ = nullptr;
     int stride_ = 0;
+    HHOOK mouse_hook_ = nullptr;
+    bool blocked_left_ = false;
+    HWND cached_top_ = nullptr;
+    HWND cached_host_ = nullptr;
+    POINT last_host_origin_{};
 #endif
     std::vector<solve::Mark> marks_;
     OverlayGeometry geom_{};
@@ -82,5 +91,3 @@ private:
     unsigned long target_pid_ = 0;
 #endif
 };
-
-

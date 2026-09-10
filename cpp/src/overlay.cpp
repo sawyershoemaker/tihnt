@@ -12,6 +12,10 @@
 #pragma comment(lib, "Dwmapi.lib")
 #endif
 
+#ifdef _WIN32
+OverlayWindow* OverlayWindow::hook_owner_ = nullptr;
+#endif
+
 OverlayWindow::OverlayWindow() {}
 OverlayWindow::~OverlayWindow(){ destroy(); }
 
@@ -19,7 +23,7 @@ bool OverlayWindow::create(){
 #ifdef _WIN32
     WNDCLASSW wc{}; wc.lpfnWndProc = &OverlayWindow::WndProcThunk; wc.hInstance = GetModuleHandle(nullptr); wc.lpszClassName = L"MinesOverlayWindow";
     static bool reg=false; if(!reg){ RegisterClassW(&wc); reg=true; }
-    hwnd_ = CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_TRANSPARENT,
+    hwnd_ = CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,
                             wc.lpszClassName, L"Mines Overlay",
                             WS_POPUP,
                             0,0, 1,1,
@@ -43,8 +47,7 @@ bool OverlayWindow::create(){
     BOOL exclude = TRUE;
     DwmSetWindowAttribute(hwnd_, DWMWA_EXCLUDED_FROM_PEEK, &exclude, sizeof(exclude));
 #endif
-    ShowWindow(hwnd_, SW_SHOWNA);
-    visible_ = true;
+    visible_ = true; // Remain hidden until a valid board and browser host arrive.
     // ensure always-on-top above most windows
     SetWindowPos(hwnd_, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     return true;
@@ -55,6 +58,9 @@ bool OverlayWindow::create(){
 
 void OverlayWindow::destroy(){
 #ifdef _WIN32
+    if(mouse_hook_){ UnhookWindowsHookEx(mouse_hook_); mouse_hook_=nullptr; }
+    if(hook_owner_==this) hook_owner_=nullptr;
+    blocked_left_=false;
     if(memdc_){ DeleteDC(memdc_); memdc_=nullptr; }
     if(dib_){ DeleteObject(dib_); dib_=nullptr; }
     bits_ = nullptr; stride_ = 0; surf_w_ = surf_h_ = 0;
@@ -69,14 +75,15 @@ void OverlayWindow::update(const std::vector<solve::Mark>& marks, const OverlayG
     bool minesChanged = (minesTotal != mines_total_);
     bool sizeChanged = (geom.board_w != geom_.board_w) || (geom.board_h != geom_.board_h)
         || diff(geom.rect_w, geom_.rect_w) || diff(geom.rect_h, geom_.rect_h)
-        || diff(geom.dpr, geom_.dpr);
-    bool positionChanged = diff(geom.rect_l, geom_.rect_l) || diff(geom.rect_t, geom_.rect_t);
+        || diff(geom.dpr, geom_.dpr) || diff(geom.vv_scale, geom_.vv_scale);
+    bool positionChanged = diff(geom.rect_l, geom_.rect_l) || diff(geom.rect_t, geom_.rect_t)
+        || diff(geom.vv_x, geom_.vv_x) || diff(geom.vv_y, geom_.vv_y);
 
     if(!marksChanged && !minesChanged && !sizeChanged && !positionChanged){
         return;
     }
 
-    marks_ = marks;
+    if(marksChanged) marks_ = marks;
     geom_ = geom;
     mines_total_ = minesTotal;
 
@@ -88,7 +95,15 @@ void OverlayWindow::update(const std::vector<solve::Mark>& marks, const OverlayG
 }
 
 void OverlayWindow::tick(){
-    
+#ifdef _WIN32
+    if(!hwnd_) return;
+    HWND host=findRenderHost();
+    if(!visible_ || !host || geom_.board_w<=0 || geom_.board_h<=0 || geom_.rect_w<=0 || geom_.rect_h<=0) { hide(); return; }
+    POINT origin{0,0};
+    if(!ClientToScreen(host,&origin)) { hide(); return; }
+    if(!IsWindowVisible(hwnd_)) redraw(true);
+    else if(origin.x!=last_host_origin_.x || origin.y!=last_host_origin_.y) redraw(false);
+#endif
 }
 
 #ifdef _WIN32
@@ -106,77 +121,59 @@ LRESULT CALLBACK OverlayWindow::WndProcThunk(HWND hwnd, UINT msg, WPARAM wp, LPA
 }
 
 HWND OverlayWindow::findRenderHost(){
-    // anchoring (should be fixed if u ctrl+q bind)
-    static HWND lastTop = nullptr;
-    static HWND lastHost = nullptr;
-
-    HWND fg = GetForegroundWindow();
-    if(!fg || fg==hwnd_){
-        if(lastHost && IsWindow(lastHost)) return lastHost;
-        return nullptr;
-    }
-
-    if(fg == lastTop && lastHost && IsWindow(lastHost)){
-        return lastHost;
-    }
-
-    auto findChildByClass = [](HWND root, const wchar_t* cls)->HWND{
-        for(HWND child = FindWindowExW(root, nullptr, nullptr, nullptr); child; child = FindWindowExW(root, child, nullptr, nullptr)){
-            wchar_t name[256]; name[0]=0; GetClassNameW(child, name, 255);
-            if(lstrcmpiW(name, cls)==0) return child;
-            HWND deeper = FindWindowExW(child, nullptr, cls, nullptr);
-            if(deeper) return deeper;
-        }
-        return nullptr;
-    };
-
-    HWND host = findChildByClass(fg, L"Chrome_RenderWidgetHostHWND");
-    if(!host) host = fg;
-
-    // if target PID set, attempt to locate a window with that PID
-    if(target_pid_ != 0){
-        DWORD pid=0; GetWindowThreadProcessId(host, &pid);
-        if(pid != target_pid_){
-            HWND best = nullptr;
-            for(HWND w = GetTopWindow(nullptr); w; w = GetNextWindow(w, GW_HWNDNEXT)){
-                DWORD p=0; GetWindowThreadProcessId(w, &p);
-                if(p == target_pid_){ best = w; break; }
+    HWND foreground=GetForegroundWindow();
+    if(!foreground || foreground==hwnd_ || IsIconic(foreground)) return nullptr;
+    wchar_t cls[128]{};
+    GetClassNameW(foreground,cls,128);
+    if(lstrcmpW(cls,L"Chrome_WidgetWin_1")!=0) return nullptr;
+    if(foreground!=cached_top_ || !cached_host_ || !IsWindow(cached_host_) || !IsWindowVisible(cached_host_)) {
+        cached_top_=foreground; cached_host_=nullptr;
+        EnumChildWindows(foreground,[](HWND child,LPARAM param)->BOOL {
+            wchar_t name[128]{};
+            GetClassNameW(child,name,128);
+            if(lstrcmpW(name,L"Chrome_RenderWidgetHostHWND")==0 && IsWindowVisible(child)) {
+                *reinterpret_cast<HWND*>(param)=child; return FALSE;
             }
-            if(best){
-                HWND h2 = findChildByClass(best, L"Chrome_RenderWidgetHostHWND");
-                host = h2 ? h2 : best;
-            }
-        }
+            return TRUE;
+        },reinterpret_cast<LPARAM>(&cached_host_));
     }
-
-    lastTop = fg;
-    lastHost = host;
-    return host;
+    if(target_pid_ && cached_host_) {
+        DWORD topPid=0,hostPid=0;
+        GetWindowThreadProcessId(foreground,&topPid);
+        GetWindowThreadProcessId(cached_host_,&hostPid);
+        if(topPid!=target_pid_ && hostPid!=target_pid_) return nullptr;
+    }
+    return cached_host_;
 }
 void OverlayWindow::set_target_pid(uint32_t pid){
-    target_pid_ = pid;
+    if(target_pid_==pid) return;
+    target_pid_=pid; cached_host_=cached_top_=nullptr;
+    redraw(true);
 }
 
 bool OverlayWindow::ensureSurface(int w, int h){
-    if(w<=0 || h<=0) return false;
-    if(w==surf_w_ && h==surf_h_ && dib_ && memdc_) return true;
+    if(w<=0 || h<=0 || w>8192 || h>8192 || static_cast<uint64_t>(w)*h>16*1024*1024) return false;
+    if(w==surf_w_ && h==surf_h_ && dib_ && memdc_ && bits_) return true;
     if(memdc_){ DeleteDC(memdc_); memdc_=nullptr; }
     if(dib_){ DeleteObject(dib_); dib_=nullptr; }
-    HDC screen = GetDC(nullptr);
-    // update layered window requires a top-down 32bpp DIB for per-pixel alpha (holy headache)
-    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h; bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
+    bits_=nullptr; surf_w_=surf_h_=stride_=0;
+    HDC screen=GetDC(nullptr);
+    if(!screen) return false;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h;
+    bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
     void* bits=nullptr;
-    dib_ = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    memdc_ = CreateCompatibleDC(screen);
-    HGDIOBJ prev = SelectObject(memdc_, dib_);
-    if(prev==NULL || prev==HGDI_ERROR){
-        std::cerr << "OverlayWindow::ensureSurface: SelectObject failed, GetLastError=" << GetLastError() << std::endl;
+    dib_=CreateDIBSection(screen,&bi,DIB_RGB_COLORS,&bits,nullptr,0);
+    memdc_=CreateCompatibleDC(screen);
+    ReleaseDC(nullptr,screen);
+    HGDIOBJ selected=(dib_ && memdc_) ? SelectObject(memdc_,dib_) : nullptr;
+    if(!selected || selected==HGDI_ERROR || !bits) {
+        if(memdc_) { DeleteDC(memdc_); memdc_=nullptr; }
+        if(dib_) { DeleteObject(dib_); dib_=nullptr; }
+        return false;
     }
-    ReleaseDC(nullptr, screen);
-    surf_w_ = w; surf_h_ = h;
-    bits_ = reinterpret_cast<unsigned char*>(bits);
-    stride_ = w * 4;
-    return dib_ && memdc_ && bits_;
+    surf_w_=w; surf_h_=h; stride_=w*4; bits_=static_cast<unsigned char*>(bits);
+    return true;
 }
 
 void OverlayWindow::hide(){
@@ -189,33 +186,43 @@ void OverlayWindow::show_noactivate(){
 
 void OverlayWindow::redraw(bool full){
     if(!hwnd_) return;
-    const double dpr = (geom_.dpr > 0.0 ? geom_.dpr : 1.0);
-    const double scalePx = dpr;
-    const double cssLeft = geom_.rect_l; // already relative to visual viewport origin
-    const double cssTop  = geom_.rect_t;
-    const double cssW = geom_.rect_w;
-    const double cssH = geom_.rect_h;
-    int dstW = (int)std::round(cssW * scalePx);
-    int dstH = (int)std::round(cssH * scalePx);
-
-    // find screen origin by converting client (0,0) of the render host
-    HWND host = findRenderHost();
-    if(!host){ /* we'll fallback later */ }
-    // convert client origin to screen, then add device-pixel offset from CSS via DPR
-    POINT origin{0,0}; int x=50, y=50;
-    if(host){
-        ClientToScreen(host, &origin);
-        x = origin.x + (int)std::round(cssLeft * scalePx);
-        y = origin.y + (int)std::round(cssTop  * scalePx);
-    } else {
-        // fallback position if we can't find a host window
-        x = 50; y = 50;
-    }
-
-    if(!ensureSurface(dstW>0?dstW:320, dstH>0?dstH:120)){ hide(); return; }
-    if(dstW<=0 || dstH<=0){ dstW = surf_w_; dstH = surf_h_; }
-    // clear to fully transparent
+    HWND host=findRenderHost();
+    if(!visible_ || !host || !game::valid_dimensions(geom_.board_w,geom_.board_h) ||
+        geom_.board_w==0 || geom_.board_h==0) { hide(); return; }
+    const double scalePx=geom_.dpr*geom_.vv_scale;
+    const double width=geom_.rect_w*scalePx, height=geom_.rect_h*scalePx;
+    const double left=(geom_.rect_l-geom_.vv_x)*scalePx, top=(geom_.rect_t-geom_.vv_y)*scalePx;
+    if(!std::isfinite(width) || !std::isfinite(height) || !std::isfinite(left) || !std::isfinite(top) ||
+        width<0.5 || height<0.5 || width>8192 || height>8192 || std::abs(left)>1000000 || std::abs(top)>1000000) { hide(); return; }
+    const int dstW=static_cast<int>(std::round(width)), dstH=static_cast<int>(std::round(height));
+    POINT origin{0,0};
+    if(!ClientToScreen(host,&origin)) { hide(); return; }
+    last_host_origin_=origin;
+    const int x=origin.x+static_cast<int>(std::round(left)), y=origin.y+static_cast<int>(std::round(top));
+    const bool resized=dstW!=surf_w_ || dstH!=surf_h_;
+    if(!ensureSurface(dstW,dstH)) { hide(); return; }
+    full |= resized;
+    if(full) paint_surface();
     BLENDFUNCTION bf{}; bf.BlendOp=AC_SRC_OVER; bf.SourceConstantAlpha=255; bf.AlphaFormat=AC_SRC_ALPHA;
+    // present using UpdateLayeredWindow (per-pixel alpha)
+    HDC screen = GetDC(nullptr);
+    SIZE siz{dstW, dstH}; POINT ptSrc{0,0}; POINT ptDst{x,y};
+    BOOL updOk = UpdateLayeredWindow(hwnd_, screen, &ptDst, &siz, memdc_, &ptSrc, 0, &bf, ULW_ALPHA);
+    if(!updOk){
+        DWORD err = GetLastError();
+        std::cerr << "OverlayWindow::redraw: UpdateLayeredWindow failed, err=" << err
+                  << " w=" << dstW << " h=" << dstH << " x=" << x << " y=" << y << std::endl;
+        ReleaseDC(nullptr,screen);
+        hide();
+        return;
+    }
+    ReleaseDC(nullptr, screen);
+    ShowWindow(hwnd_, SW_SHOWNA);
+}
+
+void OverlayWindow::paint_surface(){
+    const int dstW=surf_w_, dstH=surf_h_;
+    // clear to fully transparent
     // pixel writers available to subsequent draw helpers   
     auto putPixel = [&](int px, int py, uint32_t rgba){
         if(px<0||py<0||px>=dstW||py>=dstH) return;
@@ -246,7 +253,7 @@ void OverlayWindow::redraw(bool full){
         *reinterpret_cast<uint32_t*>(p) = bgra;
     };
 
-    if(full){
+
         std::memset(bits_, 0, (size_t)(stride_ * dstH));
 
         // draw overlay marks: green boxes for Safe, red X for Mine, orange box for Guess
@@ -259,34 +266,11 @@ void OverlayWindow::redraw(bool full){
         cached_xEdge_ = x0; cached_yEdge_ = y0;
         cached_dstW_ = dstW; cached_dstH_ = dstH;
 
-        // when safety mode is enabled, block clicks for entire cells that are NOT Safe/Guess
-        // by painting a minimally visible (alpha=1) mask across those cells.
-        if(safety_mode_){
-            const uint32_t kMaskBGRA = 0x01000000;
-            for(int yy=0; yy<h; ++yy){
-                const int cy0 = y0[yy];
-                const int cy1 = y0[yy+1] - 1;
-                for(int xx=0; xx<w; ++xx){
-                    solve::Mark m = marks_[yy*w + xx];
-                    if(m==solve::Mark::Safe || m==solve::Mark::Guess) continue;
-                    const int cx0 = x0[xx];
-                    const int cx1 = x0[xx+1] - 1;
-                    const int span = cx1 - cx0 + 1;
-                    for(int py=cy0; py<=cy1; ++py){
-                        uint32_t* row = reinterpret_cast<uint32_t*>(bits_ + py*stride_) + cx0;
-                        std::fill_n(row, span, kMaskBGRA);
-                    }
-                }
-            }
-        }
-
         // fast check: if no marks to draw, skip per-cell drawing
         bool anyMarks=false; for(const auto m : marks_){ if(m!=solve::Mark::None){ anyMarks=true; break; } }
         if(anyMarks){
         
         // cell size in target surface pixels
-        double cellW = (double)dstW / (double)w;
-        double cellH = (double)dstH / (double)h;
         const int thickness = 5; // thicker strokes for visibility
         auto drawRectStroke = [&](int x0, int y0, int x1, int y1, uint32_t color){
             uint32_t colv = toPremulBGRA(color);
@@ -298,7 +282,9 @@ void OverlayWindow::redraw(bool full){
         };
         auto fillRect = [&](int x0, int y0, int x1, int y1, uint32_t color){
             uint32_t colv = toPremulBGRA(color);
-            if(x1<x0) x1=x0; if(y1<y0) y1=y0;
+            x0=std::max(0,x0); y0=std::max(0,y0);
+            x1=std::min(dstW-1,x1); y1=std::min(dstH-1,y1);
+            if(x1<x0 || y1<y0) return;
             for(int y=y0; y<=y1; ++y){
                 uint8_t* row = bits_ + y*stride_ + x0*4;
                 for(int x=x0; x<=x1; ++x){ *reinterpret_cast<uint32_t*>(row) = colv; row += 4; }
@@ -340,6 +326,7 @@ void OverlayWindow::redraw(bool full){
             int inset = std::max(2, std::min((x1-x0), (y1-y0)) / 6);
             int lx0 = x0 + inset, ly0 = y0 + inset, lx1 = x1 - inset, ly1 = y1 - inset;
             int w=lx1-lx0, h=ly1-ly0; int n=std::max(w,h);
+            if(n<=0) { putPixelV((x0+x1)/2,(y0+y1)/2,colv); return; }
             for(int i=0;i<=n;++i){
                 int px=lx0 + i*w/n; int py=ly0 + i*h/n;
                 int px2=lx1 - i*w/n; int py2=ly0 + i*h/n;
@@ -356,7 +343,7 @@ void OverlayWindow::redraw(bool full){
                 if(m==solve::Mark::None) continue; // only overlay the specified categories
                 int cx0 = x0[xx];
                 int cx1 = x0[xx+1] - 1;
-                if(cx1<cx0) cx1=cx0;
+                if(cx1<cx0 || cy1<cy0) continue;
                 if(m==solve::Mark::Safe){
                     drawRectStroke(cx0, cy0, cx1, cy1, 0xAA00FF00); // A,R,G,B packed as ARGB
                 } else if(m==solve::Mark::Mine){
@@ -403,6 +390,9 @@ void OverlayWindow::redraw(bool full){
         if(ch>='0' && ch<='9'){
             int d = ch - '0';
             for(int r=0;r<7;++r){ unsigned char row = font5x7[d][r]; for(int c=0;c<5;++c){ if(row & (1<<(4-c))){ plot(x0+c, y0+r); } } }
+        } else if(ch=='?'){
+            const unsigned char glyph[7]={0x0E,0x11,0x01,0x02,0x04,0x00,0x04};
+            for(int r=0;r<7;++r) for(int c=0;c<5;++c) if(glyph[r]&(1<<(4-c))) plot(x0+c,y0+r);
         } else if(ch=='[' || ch==']' || ch=='='){
             // very simple brackets/equals
             if(ch=='['){ for(int r=0;r<7;++r){ plot(x0, y0+r); } for(int c=0;c<3;++c){ plot(x0+c, y0); plot(x0+c, y0+6);} }
@@ -428,7 +418,7 @@ void OverlayWindow::redraw(bool full){
     auto drawText = [&](int x, int y, const std::string& s, uint32_t color){ int pen=x; for(char ch : s){ drawChar(pen,y,ch,color); pen += 6; } };
     // always draw M= text even if board dims are zero-sized surface; guard for tiny overlays
         if(dstW>=20 && dstH>=10){
-            std::string label = "M=" + std::to_string(std::max(0, mines_total_));
+            std::string label = "M=" + (mines_total_ < 0 ? std::string("?") : std::to_string(mines_total_));
             drawText(2, 2, label, 0xFFFFFFFF);
             if(!excluded_from_capture_){
                 drawText(2, 12, std::string("VISIBLE"), 0xFFFFFFFF);
@@ -437,96 +427,48 @@ void OverlayWindow::redraw(bool full){
                 drawText(2, 22, std::string("SAFE"), 0xFF00FF00);
             }
         }
-    }
 
-    // present using UpdateLayeredWindow (per-pixel alpha)
-    HDC screen = GetDC(nullptr);
-    SIZE siz{dstW, dstH}; POINT ptSrc{0,0}; POINT ptDst{x,y};
-    BOOL updOk = UpdateLayeredWindow(hwnd_, screen, &ptDst, &siz, memdc_, &ptSrc, 0, &bf, ULW_ALPHA);
-    if(!updOk){
-        DWORD err = GetLastError();
-        std::cerr << "OverlayWindow::redraw: UpdateLayeredWindow failed, err=" << err
-                  << " w=" << dstW << " h=" << dstH << " x=" << x << " y=" << y << std::endl;
-        ptDst.x = 50; ptDst.y = 50; siz.cx = 320; siz.cy = 120;
-        ensureSurface(siz.cx, siz.cy);
-        std::memset(bits_, 0, (size_t)(stride_ * siz.cy));
-        for(int yy=0; yy<siz.cy; ++yy){ for(int xx=0; xx<siz.cx; ++xx){ putPixel(xx,yy, 0x7F000000); } }
-        updOk = UpdateLayeredWindow(hwnd_, screen, &ptDst, &siz, memdc_, &ptSrc, 0, &bf, ULW_ALPHA);
-        if(!updOk){
-            std::cerr << "OverlayWindow::redraw: Fallback UpdateLayeredWindow still failing, err=" << GetLastError() << std::endl;
+
+
+}
+
+LRESULT CALLBACK OverlayWindow::MouseHook(int code, WPARAM wp, LPARAM lp) {
+    auto* self=hook_owner_;
+    if(code>=0 && self && self->safety_mode_) {
+        if(wp==WM_LBUTTONUP && self->blocked_left_) {
+            self->blocked_left_=false; return 1;
+        }
+        if(wp==WM_LBUTTONDOWN) {
+            self->blocked_left_=false;
+            if(IsWindowVisible(self->hwnd_) && self->findRenderHost()) {
+                const auto* event=reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+                POINT p=event->pt; ScreenToClient(self->hwnd_,&p);
+                const auto& xs=self->cached_xEdge_;
+                const auto& ys=self->cached_yEdge_;
+                if(xs.size()>1 && ys.size()>1 && p.x>=0 && p.y>=0 && p.x<xs.back() && p.y<ys.back()) {
+                    const int x=static_cast<int>(std::upper_bound(xs.begin(),xs.end(),p.x)-xs.begin())-1;
+                    const int y=static_cast<int>(std::upper_bound(ys.begin(),ys.end(),p.y)-ys.begin())-1;
+                    const size_t i=static_cast<size_t>(y)*self->geom_.board_w+x;
+                    const auto mark=i<self->marks_.size() ? self->marks_[i] : solve::Mark::None;
+                    if(mark!=solve::Mark::Safe && mark!=solve::Mark::Guess && mark!=solve::Mark::ChordReady) {
+                        self->blocked_left_=true; return 1;
+                    }
+                }
+            }
         }
     }
-    ReleaseDC(nullptr, screen);
-    ShowWindow(hwnd_, SW_SHOWNA);
+    return CallNextHookEx(nullptr,code,wp,lp);
 }
 
 LRESULT OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
-    switch(msg){
-    case WM_MOUSEWHEEL:
-    case WM_MOUSEHWHEEL: {
-        if(safety_mode_){
-            short delta = GET_WHEEL_DELTA_WPARAM(wp);
-            INPUT inp = {};
-            inp.type = INPUT_MOUSE;
-            inp.mi.mouseData = (DWORD)delta;
-            inp.mi.dwFlags = (msg == WM_MOUSEWHEEL) ? MOUSEEVENTF_WHEEL : MOUSEEVENTF_HWHEEL;
-            SendInput(1, &inp, sizeof(INPUT));
-            return 0;
-        }
-        break;
-    }
-    case WM_NCHITTEST: {
-        // safety-mode selective pass-through: only allow clicks on Safe/Guess cells
-        // otherwise, return HTCLIENT to block (prevent click-through)
-        if(safety_mode_ && !marks_.empty() && geom_.board_w>0 && geom_.board_h>0){
-            POINTS pts = MAKEPOINTS(lp);
-            POINT p{ pts.x, pts.y };
-            ScreenToClient(hwnd_, &p);
-            const int w = geom_.board_w;
-            const int h = geom_.board_h;
-            const auto& xEdge = cached_xEdge_;
-            const auto& yEdge = cached_yEdge_;
-            if((int)xEdge.size()==w+1 && (int)yEdge.size()==h+1){
-                int x = p.x; int y = p.y;
-                auto locate = [&](int px, int py, int& cellx, int& celly){
-                    cellx = -1; celly = -1;
-                    for(int xx=0; xx<w; ++xx){ if(px >= xEdge[xx] && px <= xEdge[xx+1]-1){ cellx = xx; break; } }
-                    for(int yy=0; yy<h; ++yy){ if(py >= yEdge[yy] && py <= yEdge[yy+1]-1){ celly = yy; break; } }
-                };
-                int cx=-1, cy=-1; locate(x,y,cx,cy);
-                auto isSafeGuessAt = [&](int ix, int iy)->bool{
-                    if(ix<0||iy<0||ix>=w||iy>=h) return false;
-                    size_t idx = (size_t)iy * (size_t)w + (size_t)ix;
-                    if(idx >= marks_.size()) return false;
-                    auto m = marks_[idx];
-                    return (m==solve::Mark::Safe || m==solve::Mark::Guess);
-                };
-                if(cx>=0 && cy>=0 && isSafeGuessAt(cx,cy)){
-                    return HTTRANSPARENT;
-                }
-                for(int dy=-1; dy<=1; ++dy){
-                    for(int dx=-1; dx<=1; ++dx){
-                        int nx = (cx<0? -1 : cx+dx);
-                        int ny = (cy<0? -1 : cy+dy);
-                        if(!isSafeGuessAt(nx,ny)) continue;
-                        int rx0 = xEdge[nx]; int rx1 = xEdge[nx+1]-1;
-                        int ry0 = yEdge[ny]; int ry1 = yEdge[ny+1]-1;
-                        if(x>=rx0 && x<=rx1 && y>=ry0 && y<=ry1){
-                            return HTTRANSPARENT;
-                        }
-                    }
-                }
-                return HTCLIENT;
-            }
-        }
-        // default: transparent unless explicitly blocking
-        return HTTRANSPARENT;
-    }
+    switch(msg) {
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_ERASEBKGND: return 1;
-    default: break;
+    default: return DefWindowProcW(hwnd,msg,wp,lp);
     }
-    return DefWindowProcW(hwnd, msg, wp, lp);
 }
+
 #endif
 
 void OverlayWindow::set_excluded_from_capture(bool exclude){
@@ -556,9 +498,9 @@ bool OverlayWindow::is_excluded_from_capture() const{
 void OverlayWindow::set_visible(bool visible){
 #ifdef _WIN32
     if(!hwnd_) { visible_ = visible; return; }
-    if(visible){ show_noactivate(); }
-    else { hide(); }
     visible_ = visible;
+    if(visible){ redraw(true); }
+    else { hide(); }
 #else
     (void)visible;
 #endif
@@ -569,15 +511,23 @@ bool OverlayWindow::is_visible() const{
 }
 
 void OverlayWindow::set_safety_mode(bool enabled){
-    safety_mode_ = enabled;
 #ifdef _WIN32
-    if(hwnd_){
-        LONG_PTR ex = GetWindowLongPtr(hwnd_, GWL_EXSTYLE);
-        if(enabled){ ex &= ~WS_EX_TRANSPARENT; } else { ex |= WS_EX_TRANSPARENT; }
-        SetWindowLongPtr(hwnd_, GWL_EXSTYLE, ex);
-        SetWindowPos(hwnd_, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);
-        redraw(true);
+    if(enabled==safety_mode_) return;
+    if(enabled) {
+        if(hook_owner_ && hook_owner_!=this) return;
+        mouse_hook_=SetWindowsHookExW(WH_MOUSE_LL,&OverlayWindow::MouseHook,GetModuleHandleW(nullptr),0);
+        if(!mouse_hook_) { std::cerr<<"Failed to enable mouse safety: "<<GetLastError()<<'\n'; return; }
+        hook_owner_=this;
+    } else {
+        if(mouse_hook_) UnhookWindowsHookEx(mouse_hook_);
+        mouse_hook_=nullptr; hook_owner_=nullptr; blocked_left_=false;
     }
+    // Keep WS_EX_TRANSPARENT so marked pixels never capture scroll/right-click
+    // events. A hook blocks only unsafe left-button gestures across processes.
+    safety_mode_=enabled;
+    redraw(true);
+#else
+    safety_mode_=enabled;
 #endif
 }
 

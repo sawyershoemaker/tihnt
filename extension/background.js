@@ -1,96 +1,133 @@
 let socket = null;
-let connected = false;
 let debug = false;
-const endpoints = ['ws://127.0.0.1:8765', 'ws://localhost:8765'];
-let endpointIndex = 0;
+let reconnectTimer = null;
+let keepaliveTimer = null;
+let activeTabId = null;
+let hasSnapshot = false;
+let selectionVersion = 0;
+const ENDPOINT = 'ws://127.0.0.1:8765';
+const MAX_BUFFERED_BYTES = 1024 * 1024;
+const emptyBoard = () => ({ type: 'full', w: 0, h: 0, cells: [], mines_total: -1 });
 
-function log(...args) {
-  if (!debug) return;
+function log(...args) { if (debug) console.log('[tihnt/background]', ...args); }
+function isGameUrl(value) {
   try {
-    console.log('[mines-ext/bg]', ...args);
-  } catch {}
+    const url = new URL(value);
+    return (url.protocol === 'https:' || url.protocol === 'http:') &&
+      (url.hostname === 'minesweeper.online' || url.hostname.endsWith('.minesweeper.online'));
+  } catch { return false; }
 }
-
-chrome.storage.local.get({ debug: false }).then((res) => { debug = !!res.debug; });
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && Object.prototype.hasOwnProperty.call(changes, 'debug')) {
-    debug = !!changes.debug.newValue;
-    log('debug set to', debug);
+function send(message) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+    // A delta dropped under backpressure invalidates the receiver's baseline.
+    hasSnapshot = false;
+    return false;
   }
-});
-
+  try { socket.send(JSON.stringify(message)); return true; }
+  catch (error) { log('send failed', String(error)); return false; }
+}
+function requestFull() {
+  if (activeTabId === null) return;
+  chrome.tabs.sendMessage(activeTabId, { type: 'force_full' }, () => {
+    const error = chrome.runtime.lastError;
+    if (error) log('snapshot request', error.message);
+  });
+}
+function selectTab(id) {
+  if (id === activeTabId) return;
+  activeTabId = id;
+  hasSnapshot = false;
+  if (!send(emptyBoard()) && socket?.readyState === WebSocket.OPEN) socket.close();
+  requestFull();
+}
+function refreshActiveTab() {
+  const version = ++selectionVersion;
+  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+    const error = chrome.runtime.lastError;
+    if (version !== selectionVersion) return;
+    const tab = !error && tabs?.[0];
+    selectTab(tab && isGameUrl(tab.url) ? tab.id : null);
+  });
+}
+function reconnect() {
+  if (reconnectTimer !== null) return;
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 1000);
+}
 function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-  const url = endpoints[endpointIndex % endpoints.length];
-  log('ws connect', url);
-  try {
-    socket = new WebSocket(url);
-  } catch (e) {
-    log('ws ctor error', url, String(e));
-    endpointIndex = (endpointIndex + 1) % endpoints.length;
-    setTimeout(connect, 1000);
-    return;
-  }
-  socket.onopen = () => { connected = true; log('ws open', url); };
-  socket.onclose = () => {
-    connected = false;
-    log('ws close', url);
-    endpointIndex = (endpointIndex + 1) % endpoints.length;
-    setTimeout(connect, 1000);
+  let current;
+  try { current = new WebSocket(ENDPOINT); }
+  catch (error) { log('connect failed', String(error)); reconnect(); return; }
+  socket = current;
+  current.onopen = () => {
+    if (socket !== current) return;
+    hasSnapshot = false;
+    requestFull();
+    refreshActiveTab();
+    clearInterval(keepaliveTimer);
+    // Chrome 116+: traffic within 30 seconds keeps the MV3 worker alive.
+    keepaliveTimer = setInterval(() => {
+      if (socket === current && current.readyState === WebSocket.OPEN) send({ type: 'ping' });
+    }, 20000);
   };
-  socket.onerror = (e) => {
-    connected = false;
-    log('ws error', url, e);
-    try { socket.close(); } catch {}
+  current.onclose = () => {
+    if (socket !== current) return;
+    socket = null;
+    hasSnapshot = false;
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+    reconnect();
   };
-  socket.onmessage = (ev) => {
-    log('ws message', ev.data?.slice?.(0, 200));
-  };
+  current.onerror = () => { if (socket === current) current.close(); };
+  current.onmessage = (event) => log('received', String(event.data).slice(0, 200));
 }
 
+chrome.storage.local.get({ debug: false }).then((settings) => { debug = !!settings.debug; }).catch(() => {});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.debug) debug = !!changes.debug.newValue;
+});
+chrome.tabs.onActivated.addListener(refreshActiveTab);
+chrome.tabs.onUpdated.addListener((id, change) => {
+  if (id === activeTabId && (change.url || change.status === 'loading')) {
+    hasSnapshot = false;
+    if (!send(emptyBoard()) && socket?.readyState === WebSocket.OPEN) socket.close();
+  }
+  if (change.url || change.status === 'complete') refreshActiveTab();
+});
+chrome.tabs.onRemoved.addListener((id) => {
+  if (id === activeTabId) selectTab(null);
+  refreshActiveTab();
+});
+chrome.windows.onFocusChanged.addListener((id) => {
+  if (id === chrome.windows.WINDOW_ID_NONE) { ++selectionVersion; selectTab(null); }
+  else refreshActiveTab();
+});
+chrome.commands.onCommand.addListener((command) => {
+  if (command === 'toggle-logging') {
+    chrome.storage.local.get({ debug: false }).then(({ debug: current }) =>
+      chrome.storage.local.set({ debug: !current })).catch(() => {});
+  } else if (command === 'force-resend-board') {
+    hasSnapshot = false;
+    refreshActiveTab();
+    requestFull();
+  }
+});
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (sender.id !== chrome.runtime.id || sender.frameId !== 0 ||
+      sender.tab?.id !== activeTabId || !isGameUrl(sender.url) ||
+      (message?.type !== 'full' && message?.type !== 'delta')) {
+    respond({ ok: false }); return;
+  }
+  if (!hasSnapshot && message.type !== 'full') {
+    requestFull();
+    respond({ ok: false }); return;
+  }
+  const ok = send(message);
+  if (ok && message.type === 'full') hasSnapshot = true;
+  if (!ok) { hasSnapshot = false; connect(); }
+  respond({ ok });
+});
+
+refreshActiveTab();
 connect();
-
-chrome.commands.onCommand.addListener((cmd) => {
-  if (cmd === 'toggle-logging') {
-    chrome.storage.local.get({ debug: false }).then(({ debug: cur }) => {
-      const next = !cur;
-      chrome.storage.local.set({ debug: next });
-      console.log('[mines-ext/bg]', 'toggled debug to', next);
-    });
-  }
-  if (cmd === 'force-resend-board') {
-    try {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        const tab = tabs && tabs[0];
-        if (!tab) { log('force-resend: no active tab'); return; }
-        try {
-          log('force-resend: requesting full snapshot on tab', tab.id);
-          chrome.tabs.sendMessage(tab.id, { type: 'force_full' }, () => {});
-        } catch (e) {
-          log('force-resend error', String(e));
-        }
-      });
-    } catch (e) {
-      log('force-resend cmd error', String(e));
-    }
-  }
-});
-
-chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  if (!connected || !socket || socket.readyState !== WebSocket.OPEN) {
-    log('drop message (ws not open)', { readyState: socket?.readyState, connected, endpoint: endpoints[endpointIndex % endpoints.length] });
-    respond({ ok: false });
-    return;
-  }
-  try {
-    const payload = JSON.stringify(msg);
-    log('send', payload.slice(0, 200));
-    socket.send(payload);
-    respond({ ok: true });
-  } catch (e) {
-    log('send error', String(e));
-    respond({ ok: false, error: String(e) });
-  }
-});
-
-

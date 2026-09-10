@@ -5,6 +5,10 @@
 
 namespace game {
 
+inline constexpr int MaxBoardDimension = 512;
+inline constexpr int MaxBoardCells = 16384;
+bool valid_dimensions(int w, int h);
+
 enum class CellState : uint8_t {
     Unknown = 0,
     Clear = 1,
@@ -21,12 +25,13 @@ enum class CellState : uint8_t {
 };
 
 struct CellUpdate { int x; int y; CellState state; };
+bool valid_cell_state(int state);
 
 class Board {
 public:
     Board();
     void resize(int w, int h);
-    int width() const; 
+    int width() const;
     int height() const;
 
     CellState at(int x, int y) const;

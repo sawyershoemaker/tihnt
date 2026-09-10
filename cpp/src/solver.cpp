@@ -15,98 +15,73 @@
 
 namespace {
 
+enum class Sat { No, Yes, Unknown };
+
 class WorkerPool {
 public:
-    static WorkerPool& instance(){
-        static WorkerPool pool;
-        return pool;
-    }
-
-    void run(int threadsRequested, int taskCount, const std::function<void(int)>& fn){
-        if(taskCount <= 0){ return; }
-        if(threadsRequested <= 0){ threadsRequested = 1; }
-        ensure_threads(threadsRequested);
-        int maxThreads = static_cast<int>(workers_.size());
-        int active = std::min({std::max(1, threadsRequested), maxThreads, taskCount});
-        {
-            std::unique_lock<std::mutex> lock(mtx_);
-            currentTask_ = fn;
-            taskCount_ = taskCount;
-            activeThreads_ = active;
-            nextTask_.store(0, std::memory_order_relaxed);
-            workersDone_.store(0, std::memory_order_relaxed);
-            hasWork_ = true;
-        }
-        cv_.notify_all();
+    static WorkerPool& instance() { static WorkerPool pool; return pool; }
+    void run(int requested, int count, const std::function<void(int)>& fn) {
+        if (count <= 0) return;
+        std::lock_guard<std::mutex> submission(runMutex_);
+        const int active = std::min({std::max(1, requested), count, 8});
         std::unique_lock<std::mutex> lock(mtx_);
-        doneCv_.wait(lock, [&]{ return !hasWork_; });
+        while (static_cast<int>(workers_.size()) < active) {
+            const int index = static_cast<int>(workers_.size());
+            const uint64_t seen = generation_;
+            workers_.emplace_back([this, index, seen] { worker_loop(index, seen); });
+        }
+        currentTask_ = fn;
+        taskCount_ = count;
+        activeThreads_ = remaining_ = active;
+        error_ = nullptr;
+        nextTask_.store(0, std::memory_order_relaxed);
+        ++generation_;
+        cv_.notify_all();
+        doneCv_.wait(lock, [&] { return remaining_ == 0; });
+        currentTask_ = {};
+        if (error_) std::rethrow_exception(error_);
     }
-
 private:
-    WorkerPool() = default;
-    ~WorkerPool(){
+    ~WorkerPool() {
         {
             std::lock_guard<std::mutex> lock(mtx_);
             stopping_ = true;
-            hasWork_ = false;
         }
         cv_.notify_all();
-        doneCv_.notify_all();
-        for(auto& th : workers_){ if(th.joinable()) th.join(); }
+        for (auto& worker : workers_) worker.join();
     }
-
-    void ensure_threads(int threadsRequested){
-        int needed = std::max(1, threadsRequested);
-        while(static_cast<int>(workers_.size()) < needed){
-            int index = static_cast<int>(workers_.size());
-            workers_.emplace_back([this, index](){ worker_loop(index); });
-        }
-    }
-
-    void worker_loop(int index){
-        for(;;){
+    void worker_loop(int index, uint64_t seen) {
+        for (;;) {
             std::unique_lock<std::mutex> lock(mtx_);
-            cv_.wait(lock, [&]{ return stopping_ || hasWork_; });
-            if(stopping_) return;
-            if(!hasWork_){
-                continue;
-            }
-            if(index >= activeThreads_){
-                doneCv_.wait(lock, [&]{ return stopping_ || !hasWork_; });
-                if(stopping_) return;
-                continue;
-            }
+            cv_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+            if (stopping_) return;
+            seen = generation_;
+            if (index >= activeThreads_) continue;
             auto task = currentTask_;
-            int taskCount = taskCount_;
-            int participants = activeThreads_;
+            const int count = taskCount_;
             lock.unlock();
-            for(;;){
-                int cid = nextTask_.fetch_add(1, std::memory_order_relaxed);
-                if(cid >= taskCount) break;
-                task(cid);
-            }
-            if(workersDone_.fetch_add(1, std::memory_order_acq_rel) + 1 == participants){
+            try {
+                for (;;) {
+                    int id = nextTask_.fetch_add(1, std::memory_order_relaxed);
+                    if (id >= count) break;
+                    task(id);
+                }
+            } catch (...) {
                 std::lock_guard<std::mutex> guard(mtx_);
-                hasWork_ = false;
-                doneCv_.notify_all();
-            } else {
-                std::unique_lock<std::mutex> waitLock(mtx_);
-                doneCv_.wait(waitLock, [&]{ return stopping_ || !hasWork_; });
-                if(stopping_) return;
+                if (!error_) error_ = std::current_exception();
             }
+            lock.lock();
+            if (--remaining_ == 0) doneCv_.notify_one();
         }
     }
-
-    std::mutex mtx_;
-    std::condition_variable cv_;
-    std::condition_variable doneCv_;
+    std::mutex runMutex_, mtx_;
+    std::condition_variable cv_, doneCv_;
     std::vector<std::thread> workers_;
     std::function<void(int)> currentTask_;
+    std::exception_ptr error_;
     std::atomic<int> nextTask_{0};
-    std::atomic<int> workersDone_{0};
-    int taskCount_ = 0;
-    int activeThreads_ = 0;
-    bool hasWork_ = false;
+    uint64_t generation_ = 0;
+    int taskCount_ = 0, activeThreads_ = 0, remaining_ = 0;
     bool stopping_ = false;
 };
 
@@ -130,7 +105,7 @@ static inline int cell_number(CellState s){
 
 static thread_local std::mt19937 rng(std::random_device{}());
 
-Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, int threads){
+Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, int threads, const std::function<bool()>& isCancelled){
 	constexpr int UNKNOWN_TOTAL = -1;
 	Overlay ov{};
 	if(totalMines < UNKNOWN_TOTAL) totalMines = UNKNOWN_TOTAL;
@@ -138,6 +113,14 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 	const int h = board.height();
 	const int N = w * h;
 	ov.marks.assign(N, Mark::None);
+    auto cancelled = [&] { return isCancelled && isCancelled(); };
+    std::atomic<int64_t> searchWork{8000000};
+    auto searchBlock = [&] {
+        // Account in blocks to keep synchronization out of the hot recursion.
+        return !cancelled() && searchWork.fetch_sub(1024, std::memory_order_relaxed) > 0;
+    };
+    auto invalid = [&] { Overlay empty; empty.marks.assign(N, Mark::None); empty.mineProbability.assign(N, -1.0); return empty; };
+    if(cancelled()) return invalid();
 
 	if(w==0 || h==0) return ov;
 
@@ -187,7 +170,6 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
     while(!queue.empty()){
         int idxCenter = queue.back(); queue.pop_back(); inQueue[idxCenter]=0;
-		int y = idxCenter / w; int x = idxCenter % w;
 		int num = numbers[idxCenter];
         if(num < 0) continue;
         int knownMines = 0;
@@ -200,8 +182,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         }
         int remaining = num - knownMines;
         if(remaining < 0 || remaining > ucount){
-            // inconsistent; skip
-            continue;
+            return invalid();
         }
         bool any=false;
         if(remaining == 0 && ucount > 0){
@@ -209,10 +190,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         } else if(remaining == ucount && ucount>0){
             for(int i=0;i<ucount;++i){ int u=unknownIdx[i]; if(ov.marks[u] != Mark::Mine){ ov.marks[u]=Mark::Mine; any=true; enqueueNbrNumbers(u);} }
         }
+		// Rebuild both sets after deductions; mixing old and new sets is unsound.
+        if(any) continue;
 		if(ucount>0){
             for(int k=0;k<neighborCounts[idxCenter];++k){
                 int nbNumIdx = neighbors[idxCenter][k];
-				int ny = nbNumIdx / w, nx = nbNumIdx % w;
 				int num2 = numbers[nbNumIdx]; if(num2<0) continue;
                 int known2=0; int u2c=0; int u2[8];
                 for(int t=0;t<neighborCounts[nbNumIdx];++t){
@@ -223,7 +205,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 }
                 int rem1 = remaining;
                 int rem2 = num2 - known2;
-                if(rem2<0 || rem2>u2c) continue;
+                if(rem2<0 || rem2>u2c) return invalid();
                 auto isIn = [&](int v, const int* arr, int n){ for(int i=0;i<n;++i) if(arr[i]==v) return true; return false; };
                 int common=0;
                 for(int i=0;i<ucount;++i){ if(isIn(unknownIdx[i], u2, u2c)) common++; }
@@ -266,65 +248,42 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                         }
                     }
                 }
+                if(any) { if(!inQueue[idxCenter]) { queue.push_back(idxCenter); inQueue[idxCenter]=1; } break; }
             }
         }
-        (void)any;
+        if(cancelled()) return invalid();
 	}
 
-	if(enableChords){
-		for(int y=0; y<h; ++y){
-			for(int x=0; x<w; ++x){
-				int idx = to_index(x,y,w);
-				int num = cell_number(board.at(x,y));
-                if(num < 0) continue;
-				int flagged = 0;
-				int unknownCount = 0;
-				int neededMineIdx[8]; int neededCnt = 0;
-				for(int k=0; k<neighborCounts[idx]; ++k){
-					int nb = neighbors[idx][k];
-					CellState s = cells[nb];
-					if(s == CellState::Mine){ flagged++; continue; }
-					if(s == CellState::Unknown){
-						unknownCount++;
-						if(ov.marks[nb] == Mark::Mine){ neededMineIdx[neededCnt++] = nb; }
-					}
-				}
-				int missing = num - flagged;
-				if(missing < 0 || missing > unknownCount) continue;
-                if(missing == 0){
-                    int safeClicks = unknownCount;
-                    if(safeClicks > 1){
-                        bool hasPlacedFlags = (flagged > 0);
-                        if(hasPlacedFlags){
-                            if(ov.marks[idx] == Mark::None || ov.marks[idx] == Mark::Chord){
-                                ov.marks[idx] = Mark::ChordReady;
-                            }
-                        } else if(ov.marks[idx] == Mark::None){
-                            ov.marks[idx] = Mark::Chord;
-                        }
-                    }
-                } else {
-					if(neededCnt == missing){
-                        int chordCost = missing + 1;
-                        int safeClicks = unknownCount - missing;
-                        if(chordCost < safeClicks){
-							if(ov.marks[idx] == Mark::None || ov.marks[idx] == Mark::ChordReady){ ov.marks[idx] = Mark::Chord; }
-                            for(int t=0; t<neededCnt; ++t){
-                                int nb = neededMineIdx[t];
-                                ov.marks[nb] = Mark::FlagForChord;
-                            }
-						}
-					}
-				}
-			}
-		}
-	}
+    int fixedMines = 0, unresolved = 0;
+    for(int i=0; i<N; ++i) {
+        if(cells[i] == CellState::Mine || ov.marks[i] == Mark::Mine) ++fixedMines;
+        else if(cells[i] == CellState::Unknown && ov.marks[i] != Mark::Safe) ++unresolved;
+    }
+    if(totalMines >= 0) {
+        const int remaining = totalMines - fixedMines;
+        if(remaining < 0 || remaining > unresolved) return invalid();
+        if(remaining == 0 || remaining == unresolved) {
+            for(int i=0; i<N; ++i) {
+                if(cells[i] == CellState::Unknown && ov.marks[i] == Mark::None)
+                    ov.marks[i] = remaining == 0 ? Mark::Safe : Mark::Mine;
+            }
+        }
+    }
+    for(int idx : numberCells) {
+        int known=0, unknown=0;
+        for(int k=0; k<neighborCounts[idx]; ++k) {
+            int nb=neighbors[idx][k];
+            if(cells[nb]==CellState::Mine || ov.marks[nb]==Mark::Mine) ++known;
+            else if(cells[nb]==CellState::Unknown && ov.marks[nb]!=Mark::Safe) ++unknown;
+        }
+        if(numbers[idx] < known || numbers[idx] > known+unknown) return invalid();
+    }
 
 	// determine if we have any guaranteed safe so far
 	for(const auto m : ov.marks){ if(m == Mark::Safe){ ov.hasGuaranteedSafe = true; break; } }
 
         std::vector<uint8_t> isFrontier(N,0);
-        for(int i=0;i<N;++i){ if(board.data()[i]==CellState::Unknown){ for(int k=0;k<neighborCounts[i];++k){ int nb=neighbors[i][k]; if(cell_number(board.data()[nb])>=0){ isFrontier[i]=1; break; } } } }
+        for(int i=0;i<N;++i){ if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Safe && ov.marks[i]!=Mark::Mine){ for(int k=0;k<neighborCounts[i];++k){ int nb=neighbors[i][k]; if(cell_number(board.data()[nb])>=0){ isFrontier[i]=1; break; } } } }
 
         std::vector<int> compId(N,-1);
         std::vector<int> uf(N, -1);
@@ -362,14 +321,24 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             bool enumerated = false;
         };
         std::vector<CompData> comps(compCount);
-        for(int i=0;i<N;++i){ if(compId[i]>=0){ comps[compId[i]].U.push_back(i); } }
+        std::vector<int> localIndex(N, -1);
+        for(int i=0;i<N;++i){ if(compId[i]>=0){
+            auto& U = comps[compId[i]].U;
+            localIndex[i] = static_cast<int>(U.size());
+            U.push_back(i);
+        } }
+        int fixedBeforeSearch=0, freeBeforeSearch=0;
+        for(int i=0;i<N;++i) {
+            if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) ++fixedBeforeSearch;
+            else if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Safe && !isFrontier[i]) ++freeBeforeSearch;
+        }
         for(int idx=0; idx<N; ++idx){ if(cell_number(cells[idx])>=0){
             int uc=0; int tmp[8]; int known=0;
             for(int k=0;k<neighborCounts[idx];++k){ int nb=neighbors[idx][k]; if(cells[nb]==CellState::Mine || ov.marks[nb]==Mark::Mine){ known++; continue; } if(isFrontier[nb]) tmp[uc++]=nb; }
             if(uc==0) continue;
             int cid = compId[tmp[0]];
             Con con; con.num = cell_number(cells[idx]); con.knownMines = known;
-            for(int t=0;t<uc;++t){ int g=tmp[t]; for(int j=0;j<(int)comps[cid].U.size(); ++j){ if(comps[cid].U[j]==g){ con.uidx.push_back(j); break; } } }
+            for(int t=0;t<uc;++t) con.uidx.push_back(localIndex[tmp[t]]);
             comps[cid].cons.push_back(std::move(con));
         } }
 
@@ -378,6 +347,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         struct CompResult {
             bool enumerated = false;
+            bool inconsistent = false;
             std::vector<long double> waysK;
             std::vector<std::vector<long double>> mineWaysPerCellK;
             long double totalSolutions = 0.0L;
@@ -391,6 +361,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         auto process_component = [&](int cid){
             CompResult R;
+            if(cancelled()) return;
             auto& C = comps[cid];
             C.m = (int)C.U.size();
             if(C.m==0 || (int)C.cons.size()==0){ compResults[cid] = std::move(R); return; }
@@ -425,7 +396,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				};
 			std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
 				if(aborted) return;
-				if(nodeBudget == 0){ aborted = true; return; }
+				if(nodeBudget == 0 || ((nodeBudget & 1023) == 0 && !searchBlock())){ aborted = true; return; }
 				--nodeBudget;
 				if(idx==C.m){
 					R.totalSolutions += 1.0L;
@@ -442,7 +413,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				assign[var]=255;
 			};
 				dfs(0,0);
-				if(!aborted && R.totalSolutions > 0.0L){
+				if(!aborted && R.totalSolutions == 0.0L){ R.inconsistent = true; compResults[cid] = std::move(R); return; }
+                if(!aborted && R.totalSolutions > 0.0L){
 					R.enumerated = true;
 					needApprox = false;
 					R.beliefs.assign(C.m, 0.5);
@@ -450,7 +422,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					for(int t=0;t<C.m;++t){
 						long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += R.mineWaysPerCellK[t][k];
 						if(mw <= 0.0L){ R.beliefs[t] = 0.0; R.probCertainBits[t]=1; }
-						else if(std::fabsl(mw - R.totalSolutions) <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
+						else if(std::abs(mw - R.totalSolutions) <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
 						else { R.beliefs[t] = (double)(mw / R.totalSolutions); }
 					}
 				} else {
@@ -476,6 +448,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				int attempts = 0;
 				bool unsatDetected = false;
 				bool budgetExceeded = false;
+                size_t sampleBudget = MC_NODE_BUDGET;
 				auto constraint_ok = [&](int conIdx)->bool{
 					const auto& con = C.cons[conIdx];
 					int need = con.num - con.knownMines;
@@ -490,7 +463,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				std::uniform_int_distribution<int> dist01(0,1);
 				std::function<bool(int,size_t&)> dfsSample = [&](int depth, size_t& budget)->bool{
 					if(depth == C.m) return true;
-					if(budget == 0){ budgetExceeded = true; return false; }
+					if(budget == 0 || ((budget & 1023) == 0 && !searchBlock())){ budgetExceeded = true; return false; }
 					--budget;
 					int var = sampleOrder[depth];
 					std::array<int,2> choices{}; int choiceCount = 0;
@@ -510,10 +483,9 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				};
 				while(samples < MC_MAX_SAMPLES && attempts < MC_MAX_ATTEMPTS && !budgetExceeded){
 					attempts++;
-					std::fill(assignMC.begin(), assignMC.end(), 255);
+						std::fill(assignMC.begin(), assignMC.end(), uint8_t{255});
 					std::shuffle(sampleOrder.begin(), sampleOrder.end(), rng);
-					size_t budget = MC_NODE_BUDGET;
-					if(dfsSample(0, budget)){
+					if(dfsSample(0, sampleBudget)){
 						samples++;
 						for(int i=0;i<C.m;++i){ if(assignMC[i]==1) mineHits[i]++; }
 					} else {
@@ -525,15 +497,13 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					R.beliefs.assign(C.m, 0.5);
 					R.probCertainBits.assign(C.m, 0);
 					for(int i=0;i<C.m;++i){
-						double p = (double)mineHits[i] / (double)samples;
-						if(p < 1e-12) p = 0.0;
-						else if(p > 1.0 - 1e-12) p = 1.0;
-						R.beliefs[i] = p;
-						if(p == 0.0 || p == 1.0) R.probCertainBits[i] = 1;
+						// Samples never prove a cell; smooth endpoints away from certainty.
+                        R.beliefs[i] = (mineHits[i] + 1.0) / (samples + 2.0);
 					}
 					needApprox = false;
 				}
-				if(unsatDetected || budgetExceeded){
+				if(unsatDetected){ R.inconsistent = true; compResults[cid] = std::move(R); return; }
+                if(budgetExceeded){
 					needApprox = true;
 				}
 			} else {
@@ -544,8 +514,13 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				struct EdgeRef { int conIndex; int posInCon; };
 				std::vector<std::vector<EdgeRef>> varEdges(C.m);
 				for(int j=0;j<(int)C.cons.size();++j){ const auto& con=C.cons[j]; for(int p=0;p<(int)con.uidx.size();++p){ int v=con.uidx[p]; varEdges[v].push_back({j,p}); } }
-				std::vector<std::vector<int>> edgeIndexLookup(C.m);
-				for(int v=0; v<C.m; ++v){ edgeIndexLookup[v].assign((int)C.cons.size(), -1); for(int i=0;i<(int)varEdges[v].size();++i){ edgeIndexLookup[v][varEdges[v][i].conIndex]=i; } }
+                // A clue has at most eight edges: avoid the dense variables x clues table.
+                std::vector<std::vector<int>> edgeIndexLookup(C.cons.size());
+                for(size_t j=0;j<C.cons.size();++j) edgeIndexLookup[j].resize(C.cons[j].uidx.size());
+                for(int v=0;v<C.m;++v) for(int e=0;e<(int)varEdges[v].size();++e) {
+                    const auto& ref=varEdges[v][e];
+                    edgeIndexLookup[ref.conIndex][ref.posInCon]=e;
+                }
 				std::vector<std::vector<double>> vToF(C.m), fToV(C.cons.size());
 				for(int v=0; v<C.m; ++v){ vToF[v].assign(varEdges[v].size(), 0.5); }
 				for(size_t j=0;j<C.cons.size();++j){ fToV[j].assign(C.cons[j].uidx.size(), 0.5); }
@@ -555,6 +530,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				int maxDeg = 0; for(int v=0;v<C.m;++v){ maxDeg = std::max(maxDeg, (int)varEdges[v].size()); }
 				std::vector<double> pref1Buf(maxDeg+1), pref0Buf(maxDeg+1), suf1Buf(maxDeg+1), suf0Buf(maxDeg+1);
 				for(int it=0; it<BP_MAX_ITERS; ++it){
+                    if(cancelled()) return;
 					for(int j=0;j<(int)C.cons.size(); ++j){
 						const auto& con = C.cons[j];
 						const int sz = (int)con.uidx.size();
@@ -562,7 +538,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 						for(int p=0; p<sz; ++p){
 							for(int k=0;k<sz;++k) dpBuf[k]=0.0L;
 							dpBuf[0]=1.0L;
-							for(int q=0; q<sz; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=edgeIndexLookup[vv][j]; double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
+							for(int q=0; q<sz; ++q){ if(q==p) continue; int vv=con.uidx[q]; int eidx=edgeIndexLookup[j][q]; double prob=0.5; if(eidx>=0) prob=vToF[vv][eidx];
 								for(int k=0;k<sz;++k) ndpBuf[k]=0.0L;
 								for(int k=0;k<sz-1;++k){ if(dpBuf[k]==0.0L) continue; ndpBuf[k] += dpBuf[k]*(1.0L-(long double)prob); ndpBuf[k+1]+=dpBuf[k]*(long double)prob; }
 								std::swap(dpBuf,ndpBuf);
@@ -584,43 +560,49 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 				for(int v=0; v<C.m; ++v){ int deg=(int)varEdges[v].size(); double prod1=1.0,prod0=1.0; for(int i=0;i<deg;++i){ const auto&e=varEdges[v][i]; double m1=fToV[e.conIndex][e.posInCon]; prod1*=m1; prod0*=(1.0-m1);} double p = (prod1==0.0&&prod0==0.0)?0.5:(prod1/(prod1+prod0)); p=std::min(1.0-BP_EPS, std::max(BP_EPS, p)); R.beliefs[v]=p; }
 			}
 
-            if(C.m>0 && (int)C.cons.size()>0 && !R.enumerated){
-                std::vector<uint8_t> baseAssign(C.m, 255);
-                for(int t=0;t<C.m;++t){ int g=C.U[t]; if(g>=0 && g<N){ if(ov.marks[g]==Mark::Mine) baseAssign[t]=1; else if(ov.marks[g]==Mark::Safe) baseAssign[t]=0; } }
-                std::vector<int> degree2(C.m,0); for(const auto& con:C.cons){ for(int ui:con.uidx){ if(ui>=0 && ui<C.m) degree2[ui]++; } }
-                std::vector<int> order2(C.m); for(int i=0;i<C.m;++i) order2[i]=i; std::sort(order2.begin(), order2.end(), [&](int a,int b){ if(degree2[a]!=degree2[b]) return degree2[a]>degree2[b]; return a<b; });
-                size_t nodeBudget = 500000;
-                auto checkConsFor = [&](const std::vector<uint8_t>& assign, int var)->bool{
-                    for(int ci : varToCons[var]){
-                        const auto& con = C.cons[ci];
-                        int need = con.num - con.knownMines; int placed=0, unk=0;
-                        for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
-                        if(need < placed || need > placed + unk) return false;
+            if(C.m>0 && C.m<=128 && !C.cons.empty() && !R.enumerated && !cancelled()){
+                size_t budget = 500000; // Shared by all probes in this component.
+                std::vector<uint8_t> assignment(C.m, 255);
+                auto consistent = [&](int var) {
+                    for(int ci : varToCons[var]) {
+                        const auto& con=C.cons[ci];
+                        int placed=0, unknown=0;
+                        for(int v : con.uidx) {
+                            placed += assignment[v]==1;
+                            unknown += assignment[v]==255;
+                        }
+                        const int need=con.num-con.knownMines;
+                        if(need<placed || need>placed+unknown) return false;
                     }
                     return true;
                 };
-                std::function<bool(std::vector<uint8_t>&, int, size_t&)> dfsSat = [&](std::vector<uint8_t>& assign, int idx, size_t& budget)->bool{
-                    if(budget==0) return false;
-                    if(idx==C.m) return true;
-                    int var = order2[idx];
-                    if(assign[var]!=255) return dfsSat(assign, idx+1, budget);
-                    assign[var]=0; --budget;
-                    if(checkConsFor(assign, var) && dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; }
-                    assign[var]=1; if(budget>0){ --budget;
-                        if(checkConsFor(assign, var) && dfsSat(assign, idx+1, budget)){ assign[var]=255; return true; }
+                std::function<Sat(int)> search = [&](int depth) -> Sat {
+                    if(depth==C.m) return Sat::Yes;
+                    if(budget==0 || ((budget & 1023)==0 && !searchBlock())) return Sat::Unknown;
+                    --budget;
+                    const int var=order[depth];
+                    if(assignment[var]!=255) return search(depth+1);
+                    bool incomplete=false;
+                    for(uint8_t value : {uint8_t(0), uint8_t(1)}) {
+                        assignment[var]=value;
+                        const Sat result=consistent(var) ? search(depth+1) : Sat::No;
+                        assignment[var]=255;
+                        if(result==Sat::Yes) return result;
+                        incomplete |= result==Sat::Unknown;
+                        if(budget==0) return Sat::Unknown;
                     }
-                    assign[var]=255; return false;
+                    return incomplete ? Sat::Unknown : Sat::No;
                 };
-                auto isForced = [&](int varIdx)->int{
-                    if(baseAssign[varIdx]==0) return 0;
-                    if(baseAssign[varIdx]==1) return 1;
-                    std::vector<uint8_t> a0=baseAssign; a0[varIdx]=0; size_t b0=nodeBudget;
-                    bool sat0 = checkConsFor(a0, varIdx) && dfsSat(a0,0,b0);
-                    std::vector<uint8_t> a1=baseAssign; a1[varIdx]=1; size_t b1=nodeBudget;
-                    bool sat1 = checkConsFor(a1, varIdx) && dfsSat(a1,0,b1);
-                    if(sat0 && !sat1) return 0; if(!sat0 && sat1) return 1; return -1;
-                };
-                for(int t=0;t<C.m;++t){ int forced=isForced(t); if(forced==0) R.forcedSafe.push_back(C.U[t]); else if(forced==1) R.forcedMine.push_back(C.U[t]); }
+                for(int t=0;t<C.m && budget>0 && !cancelled();++t) {
+                    assignment[t]=0;
+                    const Sat safe=consistent(t) ? search(0) : Sat::No;
+                    assignment[t]=1;
+                    const Sat mine=consistent(t) ? search(0) : Sat::No;
+                    assignment[t]=255;
+                    if(safe==Sat::No && mine==Sat::No) { R.inconsistent=true; break; }
+                    if(safe==Sat::Yes && mine==Sat::No) R.forcedSafe.push_back(C.U[t]);
+                    if(safe==Sat::No && mine==Sat::Yes) R.forcedMine.push_back(C.U[t]);
+                }
             }
 
             compResults[cid] = std::move(R);
@@ -628,7 +610,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         int threadCount = threads;
         if(threadCount <= 0){ threadCount = (int)std::thread::hardware_concurrency(); if(threadCount<=0) threadCount = 1; }
-        if(compCount < 2) threadCount = 1;
+        threadCount = std::min({threadCount, std::max(1, compCount), 8});
 
         if(threadCount == 1){
             for(int cid=0; cid<compCount; ++cid){ process_component(cid); }
@@ -636,10 +618,12 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             WorkerPool::instance().run(threadCount, compCount, [&](int cid){ process_component(cid); });
         }
 
+        if(cancelled()) return invalid();
+        for(const auto& result : compResults) if(result.inconsistent) return invalid();
+
         // apply forced marks from SAT and enumerated 0/1 certainty
         bool anyForced=false;
 		for(int cid=0; cid<compCount; ++cid){
-			const auto& C = comps[cid];
 			const auto& R = compResults[cid];
 			for(int g : R.forcedSafe){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Safe){ ov.marks[g]=Mark::Safe; ov.hasGuaranteedSafe = true; anyForced=true; enqueueNbrNumbers(g);} } }
 			for(int g : R.forcedMine){ if(g>=0 && g<N){ if(ov.marks[g] != Mark::Mine){ ov.marks[g]=Mark::Mine; anyForced=true; enqueueNbrNumbers(g);} } }
@@ -650,7 +634,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 int num2 = numbers[idxCenter]; if(num2 < 0) continue;
                 int knownMines2 = 0; int unknownIdx2[8]; int ucount2 = 0;
                 for(int k=0;k<neighborCounts[idxCenter];++k){ int nb2=neighbors[idxCenter][k]; CellState s2=cells[nb2]; if(s2==CellState::Mine || ov.marks[nb2]==Mark::Mine){ knownMines2++; continue; } if(s2==CellState::Unknown && ov.marks[nb2]!=Mark::Safe){ unknownIdx2[ucount2++]=nb2; } }
-                int remaining2 = num2 - knownMines2; if(remaining2 < 0 || remaining2 > ucount2) continue;
+                int remaining2 = num2 - knownMines2; if(remaining2 < 0 || remaining2 > ucount2) return invalid();
 			if(remaining2 == 0 && ucount2 > 0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; ov.hasGuaranteedSafe = true; enqueueNbrNumbers(u);} } }
 			else if(remaining2 == ucount2 && ucount2>0){ for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Mine){ ov.marks[u]=Mark::Mine; enqueueNbrNumbers(u);} } }
             }
@@ -681,40 +665,86 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 			}
 		}
 
-		bool anyEnumerated=false; for(const auto& C : comps){ if(C.enumerated){ anyEnumerated=true; break; } }
-		if(totalMines>=0 && anyEnumerated){
-            int knownGlobal=0, unknownGlobal=0; for(int i=0;i<N;++i){ if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) knownGlobal++; else if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Safe) unknownGlobal++; }
-            int unknownInEnum=0; for(const auto& C : comps){ if(C.enumerated) unknownInEnum += C.m; }
-            int freeUnknown = std::max(0, unknownGlobal - unknownInEnum);
-            int remainingGlobal = std::max(0, totalMines - knownGlobal);
-            // comb(freeUnknown, j)
-            std::vector<long double> combFree(freeUnknown+1, 0.0L); if(freeUnknown>=0){ combFree[0]=1.0L; for(int j=1;j<=freeUnknown;++j){ combFree[j] = combFree[j-1] * (long double)(freeUnknown - (j-1)) / (long double)j; } }
-            // gather enumerated indices
-            std::vector<int> enumIdx; for(int i=0;i<(int)comps.size();++i){ if(comps[i].enumerated) enumIdx.push_back(i); }
-            int E=(int)enumIdx.size();
-            std::vector<std::vector<long double>> prefix(E+1), suffix(E+1);
-            prefix[0] = std::vector<long double>(1, 1.0L);
-            for(int i=0;i<E;++i){ const auto& C = comps[enumIdx[i]]; std::vector<long double> next(prefix[i].size()+C.m, 0.0L); for(size_t a=0;a<prefix[i].size();++a){ for(int k=0;k<=C.m;++k){ next[a+k] += prefix[i][a]*C.waysK[k]; } } prefix[i+1].swap(next); }
-            suffix[E] = std::vector<long double>(1, 1.0L);
-            for(int i=E-1;i>=0;--i){ const auto& C = comps[enumIdx[i]]; std::vector<long double> next(suffix[i+1].size()+C.m, 0.0L); for(size_t b=0;b<suffix[i+1].size();++b){ for(int k=0;k<=C.m;++k){ next[b+k] += suffix[i+1][b]*C.waysK[k]; } } suffix[i].swap(next); }
-            long double totalWeight=0.0L; for(size_t r=0;r<prefix[E].size();++r){ int needOut = remainingGlobal - (int)r; if(needOut>=0 && needOut<=freeUnknown) totalWeight += prefix[E][r]*combFree[needOut]; }
-            if(totalWeight>0.0L){
-                for(int ii=0; ii<E; ++ii){ int cid = enumIdx[ii]; auto& C = comps[cid];
-                    std::vector<long double> other(prefix[ii].size()+suffix[ii+1].size()-1, 0.0L); for(size_t a=0;a<prefix[ii].size();++a){ for(size_t b=0;b<suffix[ii+1].size();++b){ other[a+b] += prefix[ii][a]*suffix[ii+1][b]; } }
-                    for(int t=0;t<C.m;++t){
-                        long double numer=0.0L;
-                        for(int k=0;k<=C.m;++k){
-                            if(C.mineWaysPerCellK[t][k]==0.0L) continue;
-                            for(size_t rOther=0;rOther<other.size();++rOther){
-                                int needOut = remainingGlobal - ((int)rOther + k);
-                                if(needOut<0 || needOut>freeUnknown) continue;
-                                numer += C.mineWaysPerCellK[t][k] * other[rOther] * combFree[needOut];
-                            }
-                        }
-                        if(numer <= 0.0L){ ov.mineProbability[C.U[t]] = 0.0; probCertain[C.U[t]] = 1; }
-                        else if(std::fabsl(numer - totalWeight) <= 0.0L){ ov.mineProbability[C.U[t]] = 1.0; probCertain[C.U[t]] = 1; }
-                        else { ov.mineProbability[C.U[t]] = (double)(numer / totalWeight); }
+        for(int i=0;i<N;++i) {
+            if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) ov.mineProbability[i]=1;
+            else if(cells[i]!=CellState::Unknown || ov.marks[i]==Mark::Safe) ov.mineProbability[i]=0;
+        }
+
+        int enumeratedVars = 0;
+        bool allEnumerated = true;
+        for(const auto& C : comps) { allEnumerated &= C.enumerated; enumeratedVars += C.m; }
+        // Only a completely enumerated frontier supports exact conditioning.
+        // Bound the convolution cost; larger boards retain local probabilities.
+        if(totalMines>=0 && allEnumerated && enumeratedVars<=512) {
+            const int remaining=totalMines-fixedBeforeSearch;
+            const int freeCount=freeBeforeSearch;
+            if(remaining<0 || remaining>enumeratedVars+freeCount) return invalid();
+            const long double negInf=-std::numeric_limits<long double>::infinity();
+            auto logAdd = [&](long double a, long double b) {
+                if(a==negInf) return b;
+                if(b==negInf) return a;
+                if(a<b) std::swap(a,b);
+                return a+std::log1p(std::exp(b-a));
+            };
+            auto convolve = [&](const std::vector<long double>& a, const std::vector<long double>& b) {
+                std::vector<long double> out(a.size()+b.size()-1, negInf);
+                for(size_t i=0;i<a.size();++i) if(a[i]!=negInf)
+                    for(size_t j=0;j<b.size();++j) if(b[j]!=negInf)
+                        out[i+j]=logAdd(out[i+j], a[i]+b[j]);
+                return out;
+            };
+            std::vector<std::vector<long double>> logs(compCount);
+            for(int c=0;c<compCount;++c) {
+                for(long double ways : comps[c].waysK) logs[c].push_back(ways>0 ? std::log(ways) : negInf);
+            }
+            std::vector<std::vector<long double>> prefix(compCount+1), suffix(compCount+1);
+            prefix[0]={0}; suffix[compCount]={0};
+            for(int c=0;c<compCount;++c) prefix[c+1]=convolve(prefix[c], logs[c]);
+            for(int c=compCount-1;c>=0;--c) suffix[c]=convolve(logs[c], suffix[c+1]);
+            std::vector<long double> freeLog(freeCount+1, 0);
+            for(int k=1;k<=freeCount;++k)
+                freeLog[k]=freeLog[k-1]+std::log(static_cast<long double>(freeCount-k+1))-std::log(static_cast<long double>(k));
+            auto outside = [&](int k) { return k>=0 && k<=freeCount ? freeLog[k] : negInf; };
+            long double total=negInf;
+            for(int k=0;k<(int)prefix.back().size();++k) {
+                long double weight=outside(remaining-k);
+                if(weight!=negInf && prefix.back()[k]!=negInf) total=logAdd(total,prefix.back()[k]+weight);
+            }
+            if(total==negInf) return invalid();
+            for(int c=0;c<compCount;++c) {
+                if(cancelled()) return invalid();
+                const auto& C=comps[c];
+                const auto other=convolve(prefix[c], suffix[c+1]);
+                std::vector<long double> weights(C.m+1,negInf);
+                for(int k=0;k<=C.m;++k) for(int j=0;j<(int)other.size();++j) {
+                    long double out=outside(remaining-k-j);
+                    if(out!=negInf && other[j]!=negInf) weights[k]=logAdd(weights[k],other[j]+out);
+                }
+                for(int t=0;t<C.m;++t) {
+                    long double mine=negInf, safe=negInf;
+                    for(int k=0;k<=C.m;++k) if(weights[k]!=negInf) {
+                        long double m=C.mineWaysPerCellK[t][k], f=C.waysK[k]-m;
+                        if(m>0) mine=logAdd(mine,std::log(m)+weights[k]);
+                        if(f>0) safe=logAdd(safe,std::log(f)+weights[k]);
                     }
+                    const int g=C.U[t];
+                    probCertain[g]=(mine==negInf || safe==negInf);
+                    ov.mineProbability[g]=mine==negInf ? 0 : safe==negInf ? 1 :
+                        static_cast<double>(std::exp(mine-logAdd(mine,safe)));
+                }
+            }
+            if(freeCount>0) {
+                long double mine=negInf, safe=negInf;
+                for(int k=0;k<(int)prefix.back().size();++k) {
+                    const int out=remaining-k;
+                    if(out<0 || out>freeCount || prefix.back()[k]==negInf) continue;
+                    const long double weight=prefix.back()[k]+freeLog[out];
+                    if(out>0) mine=logAdd(mine,weight+std::log(static_cast<long double>(out)/freeCount));
+                    if(out<freeCount) safe=logAdd(safe,weight+std::log(static_cast<long double>(freeCount-out)/freeCount));
+                }
+                const double p=mine==negInf ? 0 : safe==negInf ? 1 : static_cast<double>(std::exp(mine-logAdd(mine,safe)));
+                for(int i=0;i<N;++i) if(cells[i]==CellState::Unknown && !isFrontier[i] && ov.marks[i]==Mark::None) {
+                    ov.mineProbability[i]=p; probCertain[i]=(mine==negInf || safe==negInf);
                 }
             }
         }
@@ -762,7 +792,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         } else {
             for(int i=0;i<N;++i){
                 if(cells[i]==CellState::Unknown && ov.marks[i]!=Mark::Safe && ov.marks[i]!=Mark::Mine && ov.mineProbability[i] < 0.0){
-                    double r = countRisk[i]>0 ? (sumRisk[i]/(double)countRisk[i]) : 1.0;
+                    double r = countRisk[i]>0 ? (sumRisk[i]/(double)countRisk[i]) : -1.0;
                     ov.mineProbability[i] = r;
                 }
             }
@@ -802,6 +832,43 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                     else if(ov.mineProbability[i] == 1.0){ if(ov.marks[i]!=Mark::Mine){ ov.marks[i]=Mark::Mine; changedByProb.push_back(i); } }
                 }
             }
+        // if new certain marks were added via probabilities, re-run local propagation around them
+        if(!changedByProb.empty()){
+            for(int idxChanged : changedByProb){ enqueueNbrNumbers(idxChanged); }
+            while(!queue.empty()){
+                int idxCenter = queue.back(); queue.pop_back(); inQueue[idxCenter]=0;
+                int y2 = idxCenter / w; (void)y2; int x2 = idxCenter % w; (void)x2;
+                int num2 = numbers[idxCenter];
+                if(num2 < 0) continue;
+                int knownMines2 = 0;
+                int unknownIdx2[8]; int ucount2 = 0;
+                for(int k=0;k<neighborCounts[idxCenter];++k){
+                    int nb2 = neighbors[idxCenter][k];
+                    CellState s2 = cells[nb2];
+                    // only count preexisting flags or deduced mines here; do not treat FlagForChord as flagged
+                    if(s2 == CellState::Mine || ov.marks[nb2] == Mark::Mine){ knownMines2++; continue; }
+                    if(s2 == CellState::Unknown && ov.marks[nb2] != Mark::Safe){ unknownIdx2[ucount2++] = nb2; }
+                }
+                int remaining2 = num2 - knownMines2;
+                if(remaining2 < 0 || remaining2 > ucount2){ return invalid(); }
+                if(remaining2 == 0 && ucount2 > 0){
+                    for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} }
+                } else if(remaining2 == ucount2 && ucount2>0){
+                    for(int i=0;i<ucount2;++i){
+                        int u=unknownIdx2[i];
+                        if(ov.marks[u] == Mark::FlagForChord || ov.marks[u] == Mark::FlagForChordReady){ continue; }
+                        if(ov.marks[u] != Mark::Mine){ ov.marks[u] = Mark::Mine; enqueueNbrNumbers(u);}
+                    }
+                }
+            }
+            // refresh guaranteed safe after propagation
+            ov.hasGuaranteedSafe = false; for(const auto m : ov.marks){ if(m==Mark::Safe){ ov.hasGuaranteedSafe=true; break; } }
+        }
+        for(int i=0;i<N;++i) {
+            if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine) ov.mineProbability[i]=1;
+            else if(cells[i]!=CellState::Unknown || ov.marks[i]==Mark::Safe) ov.mineProbability[i]=0;
+        }
+
 			// only set Guess when no guaranteed safe exists
 			if(!ov.hasGuaranteedSafe){
 				const double eps = 1e-9;
@@ -846,15 +913,6 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
     // chord valuation using probabilities and cascace heuristic
     if(enableChords && ov.mineProbability.size()==(size_t)N){
-        // clear prior chord/flag marks while preserving Safe/Mine/Guess
-        for(int i=0;i<N;++i){
-            if(ov.marks[i]==Mark::Chord || ov.marks[i]==Mark::FlagForChord
-               || ov.marks[i]==Mark::ChordReady || ov.marks[i]==Mark::FlagForChordReady){
-                ov.marks[i]=Mark::None;
-            }
-        }
-        const double kProbEps = 1e-9;
-
         struct ChordCandidate {
             int centerIdx;
             int missing;
@@ -903,7 +961,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             }
             if(vals.empty()) return 0.0;
             std::nth_element(vals.begin(), vals.begin() + std::min<int>(K, (int)vals.size()) - 1, vals.end(), [](const ValIdx& a, const ValIdx& b){ return a.v > b.v; });
-            std::sort(vals.begin(), vals.begin() + std::min<int>(K, (int)vals.size()), [](const ValIdx& a, const ValIdx& b){ return a.v > b.v; });
+            // nth_element already places the K best values in the prefix; their order is irrelevant.
             double sum = 0.0; int take = std::min<int>(K, (int)vals.size());
             for(int i=0;i<take;++i) sum += vals[i].v;
             return sum;
@@ -939,11 +997,6 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 // derive flags required (certain mines) to satisfy missing, or none if missing==0
                 std::vector<int> certainFlags = needFlags;
                 if(missing>0){
-                    for(int u : unknowns){
-                        if(ov.marks[u]==Mark::Mine) continue;
-                        double pu = probOf(u);
-                        if(pu >= 1.0 - kProbEps) certainFlags.push_back(u);
-                    }
                     if((int)certainFlags.size() != missing) continue; // cannot chord safely
                 } else {
                     // if user just placed at least one neighbor flag, allow a break-even chord with 1 unknown
@@ -975,9 +1028,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 }
 
                 int clicks = (int)pendingFlags.size() + 1;
-                if(clicks >= safeReveals){
-                    continue;
-                }
+                // Keep break-even candidates for in-progress chords and shared-flag pairs.
 
                 auto ev = computeExpected(unknowns, certainFlags, idx, -1, kCascadeDampen);
                 double totalValue = ev.first + ev.second;
@@ -1012,15 +1063,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
         const double kMargin = 1e-3;
 
-        // spatial grid so group candidate indices by board position
-        std::vector<std::vector<int>> candGrid(N);
-        for(int ci=0;ci<(int)candidates.size();++ci) candGrid[candidates[ci].centerIdx].push_back(ci);
-        // cell index sets per candidate for fast overlap checks
-        std::vector<std::unordered_set<int>> unkSets(candidates.size()), flagSets(candidates.size());
-        for(int ci=0;ci<(int)candidates.size();++ci){
-            unkSets[ci].insert(candidates[ci].unknowns.begin(), candidates[ci].unknowns.end());
-            flagSets[ci].insert(candidates[ci].flagList.begin(), candidates[ci].flagList.end());
-        }
+        std::vector<int> candGrid(N, -1);
+        for(int ci=0;ci<(int)candidates.size();++ci) candGrid[candidates[ci].centerIdx]=ci;
 
         auto tryPair = [&](int i, int j){
             if(i >= j) return;
@@ -1038,39 +1082,15 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             }
         };
 
-        // spatial grid traversal so only consider pairs within +-2 cells or sharing unknowns/flags
-        std::unordered_set<uint64_t> visited;
-        for(int ci=0;ci<(int)candidates.size();++ci){
-            int cx = candidates[ci].centerIdx % w, cy = candidates[ci].centerIdx / w;
-            for(int dy=-2; dy<=2; ++dy){ for(int dx=-2; dx<=2; ++dx){
+        // Any shared adjacent cell places the two centers within two cells.
+        // Each center occupies one grid slot, so neither hashing nor deduplication is needed.
+        for(int ci=0;ci<(int)candidates.size();++ci) {
+            int cx=candidates[ci].centerIdx%w, cy=candidates[ci].centerIdx/w;
+            for(int dy=-2;dy<=2;++dy) for(int dx=-2;dx<=2;++dx) {
                 int nx=cx+dx, ny=cy+dy;
-                if(nx<0||nx>=w||ny<0||ny>=h) continue;
-                for(int cj : candGrid[ny*w+nx]){
-                    if(cj<=ci) continue;
-                    uint64_t key = ((uint64_t)ci<<32)|(uint64_t)cj;
-                    if(visited.count(key)) continue;
-                    visited.insert(key);
-                    tryPair(ci, cj);
-                }
-            }}
-            for(int u : candidates[ci].unknowns){
-                int ux=u%w, uy=u/w;
-                for(int dy2=-1;dy2<=1;++dy2){ for(int dx2=-1;dx2<=1;++dx2){
-                    int nx=ux+dx2, ny=uy+dy2;
-                    if(nx<0||nx>=w||ny<0||ny>=h) continue;
-                    for(int cj : candGrid[ny*w+nx]){
-                        if(cj==ci) continue;
-                        uint64_t key = ci<cj ? ((uint64_t)ci<<32)|(uint64_t)cj : ((uint64_t)cj<<32)|(uint64_t)ci;
-                        if(visited.count(key)) continue;
-                        bool overlap = unkSets[cj].count(u) || flagSets[cj].count(u);
-                        if(!overlap){
-                            for(int f : candidates[ci].flagList){ if(unkSets[cj].count(f)||flagSets[cj].count(f)){ overlap=true; break; } }
-                        }
-                        if(!overlap) continue;
-                        visited.insert(key);
-                        tryPair(std::min(ci,cj), std::max(ci,cj));
-                    }
-                }}
+                if(!in_bounds(nx,ny,w,h)) continue;
+                const int cj=candGrid[ny*w+nx];
+                if(cj>ci) tryPair(ci,cj);
             }
         }
 
@@ -1163,38 +1183,6 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         }
     }
 
-        // if new certain marks were added via probabilities, re-run local propagation around them
-        if(!changedByProb.empty()){
-            for(int idxChanged : changedByProb){ enqueueNbrNumbers(idxChanged); }
-            while(!queue.empty()){
-                int idxCenter = queue.back(); queue.pop_back(); inQueue[idxCenter]=0;
-                int y2 = idxCenter / w; (void)y2; int x2 = idxCenter % w; (void)x2;
-                int num2 = numbers[idxCenter];
-                if(num2 < 0) continue;
-                int knownMines2 = 0;
-                int unknownIdx2[8]; int ucount2 = 0;
-                for(int k=0;k<neighborCounts[idxCenter];++k){
-                    int nb2 = neighbors[idxCenter][k];
-                    CellState s2 = cells[nb2];
-                    // only count preexisting flags or deduced mines here; do not treat FlagForChord as flagged
-                    if(s2 == CellState::Mine || ov.marks[nb2] == Mark::Mine){ knownMines2++; continue; }
-                    if(s2 == CellState::Unknown && ov.marks[nb2] != Mark::Safe){ unknownIdx2[ucount2++] = nb2; }
-                }
-                int remaining2 = num2 - knownMines2;
-                if(remaining2 < 0 || remaining2 > ucount2){ continue; }
-                if(remaining2 == 0 && ucount2 > 0){
-                    for(int i=0;i<ucount2;++i){ int u=unknownIdx2[i]; if(ov.marks[u] != Mark::Safe){ ov.marks[u]=Mark::Safe; enqueueNbrNumbers(u);} }
-                } else if(remaining2 == ucount2 && ucount2>0){
-                    for(int i=0;i<ucount2;++i){
-                        int u=unknownIdx2[i];
-                        if(ov.marks[u] == Mark::FlagForChord || ov.marks[u] == Mark::FlagForChordReady){ continue; }
-                        if(ov.marks[u] != Mark::Mine){ ov.marks[u] = Mark::Mine; enqueueNbrNumbers(u);}
-                    }
-                }
-            }
-            // refresh guaranteed safe after propagation
-            ov.hasGuaranteedSafe = false; for(const auto m : ov.marks){ if(m==Mark::Safe){ ov.hasGuaranteedSafe=true; break; } }
-        }
         }
 
 		// if we still have neither safe moves nor probabilities to guide, fall back to a region-weighted guess
@@ -1257,8 +1245,8 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					std::vector<uint8_t> inRegion(N, 0);
 					for(int cellIdx : bestRegion.cells) inRegion[cellIdx] = 1;
 					std::vector<int> regionDist(N, -1);
-					std::vector<int> queue;
-					queue.reserve(bestRegion.cells.size());
+std::vector<int> regionQueue;
+					regionQueue.reserve(bestRegion.cells.size());
 					for(int cellIdx : bestRegion.cells){
 						int x = cellIdx % w;
 						int y = cellIdx / w;
@@ -1270,11 +1258,11 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 						}
 						if(boundary){
 							regionDist[cellIdx] = 0;
-							queue.push_back(cellIdx);
+							regionQueue.push_back(cellIdx);
 						}
 					}
-					for(size_t qi=0; qi<queue.size(); ++qi){
-						int cur = queue[qi];
+					for(size_t qi=0; qi<regionQueue.size(); ++qi){
+						int cur = regionQueue[qi];
 						int distCur = regionDist[cur];
 						int x = cur % w;
 						int y = cur / w;
@@ -1286,7 +1274,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 							if(!inRegion[nidx]) continue;
 							if(regionDist[nidx] != -1) continue;
 							regionDist[nidx] = distCur + 1;
-							queue.push_back(nidx);
+							regionQueue.push_back(nidx);
 						}
 					}
 					int bestParity = (bestRegion.parityCount[0] >= bestRegion.parityCount[1]) ? 0 : 1;
@@ -1348,12 +1336,17 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					}
 				} else {
 					int bestIdx=-1; int bestDist=std::numeric_limits<int>::max();
-					for(int y=0;y<h;++y){ for(int x=0;x<w;++x){ if(board.at(x,y)==CellState::Unknown){ int dx=x-cx, dy=y-cy; int d=dx*dx+dy*dy; if(d<bestDist){ bestDist=d; bestIdx=to_index(x,y,w);} } } }
+					for(int y=0;y<h;++y){ for(int x=0;x<w;++x){ if(board.at(x,y)==CellState::Unknown && ov.marks[to_index(x,y,w)]!=Mark::Mine && ov.marks[to_index(x,y,w)]!=Mark::FlagForChord){ int dx=x-cx, dy=y-cy; int d=dx*dx+dy*dy; if(d<bestDist){ bestDist=d; bestIdx=to_index(x,y,w);} } } }
 					if(bestIdx>=0) ov.marks[bestIdx]=Mark::Guess;
 				}
 			}
 		}
 
+    if(cancelled()) return invalid();
+    for(int i=0;i<N;++i) {
+        if(cells[i]==CellState::Mine || ov.marks[i]==Mark::Mine || ov.marks[i]==Mark::FlagForChord) ov.mineProbability[i]=1;
+        else if(cells[i]!=CellState::Unknown || ov.marks[i]==Mark::Safe) ov.mineProbability[i]=0;
+    }
 	return ov;
 }
 

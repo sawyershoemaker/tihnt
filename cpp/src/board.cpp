@@ -1,11 +1,32 @@
 #include "board.hpp"
+#include <algorithm>
+#include <stdexcept>
+#include <utility>
 
 namespace game {
+
+bool valid_dimensions(int w, int h) {
+    return (w == 0 && h == 0) || (w > 0 && h > 0 && w <= MaxBoardDimension &&
+        h <= MaxBoardDimension && w <= MaxBoardCells / h);
+}
+
+bool valid_cell_state(int state) {
+    return state == 0 || state == 1 || state == 2 || (state >= 10 && state <= 18);
+}
+
+static void validate(const std::vector<CellState>& cells, int w, int h) {
+    if (!valid_dimensions(w, h) || cells.size() != static_cast<size_t>(w) * h ||
+        !std::all_of(cells.begin(), cells.end(), [](CellState s) { return valid_cell_state(static_cast<int>(s)); })) {
+        throw std::invalid_argument("Invalid board dimensions or cells");
+    }
+}
 
 Board::Board() {}
 
 void Board::resize(int w, int h){
-    w_ = w; h_ = h; cells_.assign(w_*h_, CellState::Unknown);
+    if (!valid_dimensions(w, h)) throw std::invalid_argument("Invalid board dimensions");
+    std::vector<CellState> cells(static_cast<size_t>(w) * h, CellState::Unknown);
+    cells_ = std::move(cells); w_ = w; h_ = h;
 }
 
 int Board::width() const { return w_; }
@@ -19,7 +40,7 @@ CellState Board::at(int x, int y) const {
 }
 
 void Board::set(int x, int y, CellState s){
-    if(x<0||y<0||x>=w_||y>=h_) return;
+    if(x<0||y<0||x>=w_||y>=h_||!valid_cell_state(static_cast<int>(s))) return;
     cells_[index(x,y)] = s;
 }
 
@@ -28,11 +49,13 @@ void Board::apply_updates(const std::vector<CellUpdate>& updates){
 }
 
 void Board::apply_full(const std::vector<CellState>& all, int w, int h){
-    w_ = w; h_ = h; cells_ = all; if((int)cells_.size()!=w_*h_) cells_.assign(w_*h_, CellState::Unknown);
+    validate(all, w, h);
+    cells_ = all; w_ = w; h_ = h;
 }
 
 void Board::apply_full(std::vector<CellState>&& all, int w, int h){
-    w_ = w; h_ = h; cells_ = std::move(all); if((int)cells_.size()!=w_*h_) cells_.assign(w_*h_, CellState::Unknown);
+    validate(all, w, h);
+    cells_ = std::move(all); w_ = w; h_ = h;
 }
 
 std::vector<CellUpdate> Board::diff(const Board& other) const {
