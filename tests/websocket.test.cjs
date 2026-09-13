@@ -3,9 +3,28 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
+const { createInterface } = require('node:readline');
 const { setTimeout: delay } = require('node:timers/promises');
-let fixture, port;
+let fixture, fixtureLines, port;
 const sockets = new Set();
+
+function outputLine(expected, timeout = 3000) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      fixtureLines.off('line', onLine);
+      fixture.off('exit', onExit);
+      fixture.off('error', onError);
+    };
+    const onLine = (line) => { if (line === expected) { cleanup(); resolve(); } };
+    const onExit = (code) => { cleanup(); reject(Error('fixture exited early: ' + code)); };
+    const onError = (error) => { cleanup(); reject(error); };
+    const timer = setTimeout(() => { cleanup(); reject(Error('fixture output timeout: ' + expected)); }, timeout);
+    fixtureLines.on('line', onLine);
+    fixture.once('exit', onExit);
+    fixture.once('error', onError);
+  });
+}
 
 async function start() {
   const reservation = net.createServer();
@@ -14,11 +33,9 @@ async function start() {
   port = reservation.address().port;
   await new Promise((resolve) => reservation.close(resolve));
   fixture = spawn(process.env.TIHNT_WS_FIXTURE, [String(port)], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  fixtureLines = createInterface({ input: fixture.stdout });
   fixture.stderr.on('data', () => {});
-  await Promise.race([
-    once(fixture.stdout, 'data').then(([data]) => assert.match(String(data), /READY/)),
-    once(fixture, 'exit').then(([code]) => { throw Error('fixture exited early: ' + code); })
-  ]);
+  await outputLine('READY');
 }
 before(start);
 after(async () => {
@@ -141,6 +158,31 @@ test('large valid text frames round-trip through partial sends', async () => {
   await close(reader);
 });
 
+test('coalesced frames retain ordering across buffered reads and messages', async () => {
+  const reader = await connect();
+  const messages = Array.from({ length: 1000 }, (_, i) => 'message ' + i);
+  reader.socket.write(Buffer.concat(messages.map((text) => frame(1, text))));
+  for (const text of messages) {
+    const result = await reader.frame();
+    assert.equal(result.opcode, 1);
+    assert.equal(String(result.payload), text);
+  }
+  await close(reader);
+});
+
+test('maximum-size messages and Unicode split across fragments remain valid', async () => {
+  const reader = await connect();
+  const text = 'a'.repeat(1024 * 1024 - 4) + '\u{1f600}';
+  const bytes = Buffer.from(text);
+  reader.socket.write(Buffer.concat([
+    frame(1, bytes.subarray(0, bytes.length - 2), false),
+    frame(9, 'boundary'), frame(0, bytes.subarray(bytes.length - 2))
+  ]));
+  assert.equal((await reader.frame()).opcode, 10);
+  assert.equal(String((await reader.frame()).payload), text);
+  await close(reader);
+});
+
 test('ordinary web origins and malformed upgrade headers are rejected', async () => {
   const requests = [
     handshake('https://minesweeper.online'), handshake('https://attacker.test'),
@@ -213,8 +255,90 @@ test('disconnects, replacements, and callback failures leave the server usable',
   await close(healthy);
 });
 
-test('shutdown interrupts both an idle client and an incomplete HTTP handshake', async () => {
+test('nonstandard message and connection callback exceptions preserve server lifecycle', async () => {
+  const reader = await connect();
+  reader.socket.write(frame(1, 'throw nonstandard'));
+  if (!reader.closed) await once(reader.socket, 'close');
+  const arm = await connect();
+  arm.socket.write(frame(1, 'throw connections'));
+  assert.equal(String((await arm.frame()).payload), 'throw connections');
+  await close(arm);
+  for (let i = 0; i < 3; ++i) {
+    const healthy = await connect();
+    healthy.socket.write(frame(1, 'connection callback recovered ' + i));
+    assert.equal(String((await healthy.frame()).payload), 'connection callback recovered ' + i);
+    await close(healthy);
+  }
+});
+
+test('a replacement interrupts a blocked sender without delaying its first message', async () => {
+  const previous = await connect();
+  previous.socket.pause();
+  const sending = outputLine('SENDING');
+  const done = outputLine('FLOOD_DONE');
+  previous.socket.write(frame(1, 'flood'));
+  await sending;
+  await delay(75);
+  const start = performance.now();
+  const replacement = await connect();
+  replacement.socket.write(frame(1, 'replacement is ready'));
+  assert.equal(String((await replacement.frame()).payload), 'replacement is ready');
+  assert.ok(performance.now() - start < 750, 'replacement blocked behind a socket write');
+  await done;
+  await close(previous); await close(replacement);
+});
+
+test('partial headers and fragmented messages expire even while pings arrive', async () => {
+  for (const fragmented of [false, true]) {
+    const reader = await connect();
+    const closed = new Promise((resolve) => reader.socket.once('close', resolve));
+    const start = performance.now();
+    reader.socket.write(fragmented ? frame(1, 'unfinished', false) : Buffer.from([0x81]));
+    const keepalive = fragmented ? setInterval(() => {
+      if (!reader.closed) reader.socket.write(frame(9, 'still waiting'));
+    }, 100) : null;
+    let forcedClose = false;
+    const deadline = setTimeout(() => { forcedClose = true; reader.socket.destroy(); }, 6500);
+    await closed;
+    clearTimeout(deadline); clearInterval(keepalive);
+    assert.ok(!forcedClose, 'partial frame ignored its receive deadline');
+    assert.ok(performance.now() - start >= 4500, 'a valid partial frame was rejected before its deadline');
+    while (reader.buffer.length) assert.equal((await reader.frame()).opcode, 10, 'incomplete text reached the callback');
+  }
+  const healthy = await connect();
+  healthy.socket.write(frame(1, 'receive deadline recovered'));
+  assert.equal(String((await healthy.frame()).payload), 'receive deadline recovered');
+  await close(healthy);
+});
+
+test('an expired write closes the stream before it can send another frame', async () => {
+  const reader = await connect();
+  reader.socket.pause();
+  const done = outputLine('FLOOD_DONE', 8000);
+  reader.socket.write(frame(1, 'flood'));
+  await done;
+  // Discard the buffered portion of the intentionally interrupted large frame.
+  reader.socket.removeAllListeners('data');
+  const closed = reader.closed ? Promise.resolve() : once(reader.socket, 'close');
+  reader.socket.resume();
+  let forcedClose = false;
+  const deadline = setTimeout(() => { forcedClose = true; reader.socket.destroy(); }, 2000);
+  await closed;
+  clearTimeout(deadline);
+  assert.ok(!forcedClose, 'a failed send left a broken stream open');
+  const healthy = await connect();
+  healthy.socket.write(frame(1, 'write deadline recovered'));
+  assert.equal(String((await healthy.frame()).payload), 'write deadline recovered');
+  await close(healthy);
+});
+
+test('shutdown interrupts a blocked sender and an incomplete HTTP handshake', async () => {
   const idle = await connect();
+  idle.socket.pause();
+  const sending = outputLine('SENDING');
+  idle.socket.write(frame(1, 'flood'));
+  await sending;
+  await delay(75);
   const slow = await tcp();
   slow.socket.write('GET / HTTP/1.1\r\n');
   await delay(25);
@@ -223,6 +347,6 @@ test('shutdown interrupts both an idle client and an incomplete HTTP handshake',
   fixture.stdin.end('stop\n');
   const [code] = await exit;
   assert.equal(code, 0);
-  assert.ok(performance.now() - start < 1500, 'shutdown blocked on socket input');
+  assert.ok(performance.now() - start < 750, 'shutdown blocked behind a socket write');
   await close(idle); await close(slow);
 });

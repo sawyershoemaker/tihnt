@@ -3,6 +3,7 @@ let debug = false;
 let reconnectTimer = null;
 let keepaliveTimer = null;
 let activeTabId = null;
+let activeWindowId = null;
 let hasSnapshot = false;
 let selectionVersion = 0;
 const ENDPOINT = 'ws://127.0.0.1:8765';
@@ -34,20 +35,25 @@ function requestFull() {
     if (error) log('snapshot request', error.message);
   });
 }
-function selectTab(id) {
+function selectTab(id, windowId = null) {
+  activeWindowId = windowId;
   if (id === activeTabId) return;
   activeTabId = id;
   hasSnapshot = false;
   if (!send(emptyBoard()) && socket?.readyState === WebSocket.OPEN) socket.close();
   requestFull();
 }
-function refreshActiveTab() {
+function refreshActiveTab(forceFull = false) {
   const version = ++selectionVersion;
-  chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+  chrome.windows.getLastFocused({ populate: true }, (window) => {
     const error = chrome.runtime.lastError;
     if (version !== selectionVersion) return;
-    const tab = !error && tabs?.[0];
-    selectTab(tab && isGameUrl(tab.url) ? tab.id : null);
+    const focused = !error && window?.focused;
+    const tab = focused && window.tabs?.find((candidate) => candidate.active);
+    const previous = activeTabId;
+    selectTab(tab && tab.status !== 'loading' && isGameUrl(tab.url) ? tab.id : null,
+      focused ? window.id : null);
+    if (forceFull && previous === activeTabId) requestFull();
   });
 }
 function reconnect() {
@@ -63,8 +69,7 @@ function connect() {
   current.onopen = () => {
     if (socket !== current) return;
     hasSnapshot = false;
-    requestFull();
-    refreshActiveTab();
+    refreshActiveTab(true);
     clearInterval(keepaliveTimer);
     // Chrome 116+: traffic within 30 seconds keeps the MV3 worker alive.
     keepaliveTimer = setInterval(() => {
@@ -87,21 +92,25 @@ chrome.storage.local.get({ debug: false }).then((settings) => { debug = !!settin
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.debug) debug = !!changes.debug.newValue;
 });
-chrome.tabs.onActivated.addListener(refreshActiveTab);
+chrome.tabs.onActivated.addListener(({ windowId }) => {
+  if (windowId === activeWindowId) selectTab(null, windowId);
+  refreshActiveTab();
+});
 chrome.tabs.onUpdated.addListener((id, change) => {
   if (id === activeTabId && (change.url || change.status === 'loading')) {
-    hasSnapshot = false;
-    if (!send(emptyBoard()) && socket?.readyState === WebSocket.OPEN) socket.close();
+    ++selectionVersion;
+    selectTab(null, activeWindowId);
   }
-  if (change.url || change.status === 'complete') refreshActiveTab();
+  if (change.url || change.status === 'loading' || change.status === 'complete') refreshActiveTab();
 });
 chrome.tabs.onRemoved.addListener((id) => {
   if (id === activeTabId) selectTab(null);
   refreshActiveTab();
 });
 chrome.windows.onFocusChanged.addListener((id) => {
-  if (id === chrome.windows.WINDOW_ID_NONE) { ++selectionVersion; selectTab(null); }
-  else refreshActiveTab();
+  ++selectionVersion;
+  selectTab(null);
+  if (id !== chrome.windows.WINDOW_ID_NONE) refreshActiveTab();
 });
 chrome.commands.onCommand.addListener((command) => {
   if (command === 'toggle-logging') {
@@ -109,12 +118,12 @@ chrome.commands.onCommand.addListener((command) => {
       chrome.storage.local.set({ debug: !current })).catch(() => {});
   } else if (command === 'force-resend-board') {
     hasSnapshot = false;
-    refreshActiveTab();
-    requestFull();
+    refreshActiveTab(true);
   }
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.frameId !== 0 ||
+      (sender.documentLifecycle && sender.documentLifecycle !== 'active') ||
       sender.tab?.id !== activeTabId || !isGameUrl(sender.url) ||
       (message?.type !== 'full' && message?.type !== 'delta')) {
     respond({ ok: false }); return;

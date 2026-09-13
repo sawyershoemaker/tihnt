@@ -15,7 +15,7 @@
 
 - on screen overlay with capture exclusion where Windows and the capture app support it
 - discrete keyboard shortcuts for toggles
-- advanced chording (toggleable), and a safe mode that blocks left clicks outside suggested cells
+- advanced chording (toggleable), and a safe mode that filters left-button presses using suggested cells
 - bounded solver searches, background calculations, and incremental board updates
 
 ## keybinds
@@ -29,6 +29,20 @@
 - **Ctrl + Shift + L** — Toggle extension logging
 
 The mine amount is remembered, so update or clear it when changing difficulty. Flags are assumed correct. Green is safe, red is a mine, and orange is a guess. Blue marks show a chord and mines to flag first; yellow marks show a chord ready to use. **Guesses can still hit mines, including with safety enabled.** Right clicks and scrolling pass through.
+
+Safety checks the cell where a left-button press starts. Drag releases, middle clicks, and the site's swapped-button/flag modes are not protected.
+
+Hints hide on rotated, reflected, or skewed boards and during detected transform animations. They return when supported geometry is restored.
+
+Page overflow clips the hints to the visible part of the board. Detected unsupported masks, rounded clips, and disconnected visible regions hide them until a supported layout returns.
+
+Hints also respect cutouts in the browser's native windows, including holes and separate visible pieces.
+
+Hidden or displaced cells on a clipped board also hide hints until the grid is restored.
+
+Rapid updates can briefly hide clipped hints while a fresh visibility measurement is pending.
+
+If a desktop shortcut is already taken, TIHNT shows which one and exits. Close the conflicting app or release its shortcut before starting again.
 
 ## compiling..
 
@@ -48,11 +62,13 @@ Capture exclusion uses [Windows display affinity](https://learn.microsoft.com/en
 
 ## checks
 
-Node.js 20+ enables the extension and websocket tests alongside the native solver, parser, and rendering tests:
+Node.js 20+ enables the extension and websocket tests alongside the native solver, parser, session, and rendering tests:
 
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
 .\build\cpp\Release\core_tests.exe --benchmark
+.\build\cpp\Release\core_tests.exe --benchmark-frontier
+.\build\cpp\Release\overlay_tests.exe --benchmark
 ```
 
 For the real extension/native server browser check:
@@ -63,5 +79,7 @@ npx playwright install chromium
 $env:TIHNT_WS_FIXTURE = (Resolve-Path .\build\cpp\Release\ws_fixture.exe).Path
 npm run test:browser
 ```
+
+Set `$env:TIHNT_CAPTURE_BENCHMARK='1'` before the browser check to measure capture latency and burst work on an offline expert board.
 
 GitHub Actions checks Windows and Linux, including the browser test and sanitizers. Linux builds the portable solver/parser tests; the overlay is Windows-only.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -37,7 +38,7 @@ public:
     bool is_connected() const {
 #ifdef _WIN32
         std::lock_guard<std::mutex> lock(client_mutex_);
-        return client_socket_ != INVALID_SOCKET;
+        return running_ && !client_stopping_ && client_socket_ != INVALID_SOCKET;
 #else
         return false;
 #endif
@@ -55,10 +56,16 @@ private:
     SOCKET listen_socket_ = INVALID_SOCKET;
     SOCKET client_socket_ = INVALID_SOCKET;
     SOCKET handshake_socket_ = INVALID_SOCKET;
+    std::atomic<bool> client_stopping_{false};
     bool winsock_ready_ = false;
     mutable std::mutex client_mutex_;
+    struct ReceiveBuffer {
+        std::string bytes;
+        std::size_t consumed = 0;
+    };
     bool send_frame(SOCKET s, uint8_t opcode, const std::string& data);
-    bool read_message(SOCKET s, std::string& buffered, std::string& text);
+    bool send_frame_locked(SOCKET s, uint8_t opcode, const std::string& data);
+    bool read_message(SOCKET s, ReceiveBuffer& buffered, std::string& text);
 #endif
 
     std::thread accept_thread_;

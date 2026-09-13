@@ -151,7 +151,7 @@ bool parse_message(const std::string& json, ParsedMessage& out) {
     GeometryMsg geometry;
     std::string type;
     bool gotW = false, gotH = false, gotCells = false, gotUpdates = false, gotPid = false;
-    unsigned rectKeys = 0;
+    unsigned rectKeys = 0, clipKeys = 0;
     const bool ok = r.object([&](const std::string& key) {
         if (key == "type") return r.string(type);
         if (key == "w") { gotW = true; return r.integer(parsed.full.w); }
@@ -196,6 +196,10 @@ bool parse_message(const std::string& json, ParsedMessage& out) {
         else if (key == "rect_t") { value = &geometry.rect_t; rectKeys |= 2; }
         else if (key == "rect_w") { value = &geometry.rect_w; rectKeys |= 4; }
         else if (key == "rect_h") { value = &geometry.rect_h; rectKeys |= 8; }
+        else if (key == "clip_l") { value = &geometry.clip_l; clipKeys |= 1; }
+        else if (key == "clip_t") { value = &geometry.clip_t; clipKeys |= 2; }
+        else if (key == "clip_w") { value = &geometry.clip_w; clipKeys |= 4; }
+        else if (key == "clip_h") { value = &geometry.clip_h; clipKeys |= 8; }
         else if (key == "vv_x") value = &geometry.vv_x;
         else if (key == "vv_y") value = &geometry.vv_y;
         else if (key == "vv_scale") value = &geometry.vv_scale;
@@ -204,9 +208,12 @@ bool parse_message(const std::string& json, ParsedMessage& out) {
         return r.number(*value) && std::abs(*value) <= 1000000;
     });
     if (!ok || !r.finished() || (rectKeys != 0 && rectKeys != 15) ||
+        (clipKeys != 0 && (clipKeys != 15 || rectKeys != 15)) ||
         geometry.rect_w < 0 || geometry.rect_h < 0 || geometry.rect_w > 16384 || geometry.rect_h > 16384 ||
+        geometry.clip_w < 0 || geometry.clip_h < 0 || geometry.clip_w > 16384 || geometry.clip_h > 16384 ||
         geometry.vv_scale <= 0 || geometry.vv_scale > 16 || geometry.dpr <= 0 || geometry.dpr > 16) return false;
     geometry.has_geometry = rectKeys == 15;
+    geometry.has_clip = clipKeys == 15;
     if (type == "full") {
         if (!gotW || !gotH || !gotCells || !game::valid_dimensions(parsed.full.w, parsed.full.h) ||
             parsed.full.cells.size() != static_cast<size_t>(parsed.full.w) * parsed.full.h) return false;

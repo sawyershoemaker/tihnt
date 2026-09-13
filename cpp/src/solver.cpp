@@ -317,6 +317,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             int m = 0;
             std::vector<long double> waysK;
             std::vector<std::vector<long double>> mineWaysPerCellK;
+            std::vector<std::vector<long double>> safeWaysPerCellK;
             long double totalSolutions = 0.0L;
             bool enumerated = false;
         };
@@ -342,7 +343,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             comps[cid].cons.push_back(std::move(con));
         } }
 
-	const int ENUM_MAX_VARS = 32;
+	const int ENUM_MAX_VARS = 128;
 	const size_t ENUM_NODE_BUDGET = 8000000;
 
         struct CompResult {
@@ -350,6 +351,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             bool inconsistent = false;
             std::vector<long double> waysK;
             std::vector<std::vector<long double>> mineWaysPerCellK;
+            std::vector<std::vector<long double>> safeWaysPerCellK;
             long double totalSolutions = 0.0L;
             std::vector<double> beliefs; // size m, [-1 if unknown]
             std::vector<uint8_t> probCertainBits; // size m
@@ -377,42 +379,73 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 
 			bool needApprox = true;
 			if(C.m <= ENUM_MAX_VARS){
-				// exact enumeration with guard against state explosion
-				R.totalSolutions = 0.0L;
-				R.waysK.assign(C.m+1, 0.0L);
-				R.mineWaysPerCellK.assign(C.m, std::vector<long double>(C.m+1, 0.0L));
-				std::vector<uint8_t> assign(C.m, 255);
-				size_t nodeBudget = ENUM_NODE_BUDGET;
-				bool aborted = false;
-			auto checkConstraintsFor = [&](int var)->bool{
-					for(int ci : varToCons[var]){
-						const auto& con = C.cons[ci];
-						int need = con.num - con.knownMines;
-						int placed=0, unk=0;
-						for(int ui: con.uidx){ if(assign[ui]==1) placed++; else if(assign[ui]==255) unk++; }
-						if(need < placed || need > placed + unk) return false;
-					}
-					return true;
-				};
-			std::function<void(int,int)> dfs = [&](int idx, int minesSoFar){
-				if(aborted) return;
-				if(nodeBudget == 0 || ((nodeBudget & 1023) == 0 && !searchBlock())){ aborted = true; return; }
-				--nodeBudget;
-				if(idx==C.m){
-					R.totalSolutions += 1.0L;
-					R.waysK[minesSoFar] += 1.0L;
-					for(int t=0;t<C.m;++t){ if(assign[t]==1) R.mineWaysPerCellK[t][minesSoFar] += 1.0L; }
-					return;
-				}
-				int var = order[idx];
-				assign[var]=0;
-				if(checkConstraintsFor(var)){ dfs(idx+1, minesSoFar); }
-				if(aborted){ assign[var]=255; return; }
-				assign[var]=1;
-				if(checkConstraintsFor(var)){ dfs(idx+1, minesSoFar+1); }
-				assign[var]=255;
-			};
-				dfs(0,0);
+                // Cells touching identical clues are interchangeable. Search the
+                // number of mines in each group, weighted by binomial choices.
+                struct Group { std::vector<int> vars; std::vector<int> cons; std::vector<long double> choose; };
+                std::vector<Group> groups;
+                std::vector<int> groupedOrder(C.m);
+                for(int t=0;t<C.m;++t) groupedOrder[t]=t;
+                // Keep bounded search order identical across standard libraries.
+                std::sort(groupedOrder.begin(),groupedOrder.end(),[&](int a,int b){
+                    return varToCons[a]!=varToCons[b] ? varToCons[a]<varToCons[b] : a<b;
+                });
+                for(int t : groupedOrder) {
+                    if(groups.empty() || groups.back().cons!=varToCons[t]) groups.push_back({{},varToCons[t],{}});
+                    groups.back().vars.push_back(t);
+                }
+                std::sort(groups.begin(),groups.end(),[](const Group& a,const Group& b){
+                    if(a.cons.size()!=b.cons.size()) return a.cons.size()>b.cons.size();
+                    return a.vars.front()<b.vars.front();
+                });
+                for(auto& group : groups) {
+                    const int size=static_cast<int>(group.vars.size());
+                    group.choose.assign(size+1,1);
+                    for(int k=1;k<size;++k) group.choose[k]=group.choose[k-1]*(size-k+1)/k;
+                }
+                R.totalSolutions=0;
+                R.waysK.assign(C.m+1,0);
+                R.mineWaysPerCellK.assign(C.m,std::vector<long double>(C.m+1,0));
+                R.safeWaysPerCellK.assign(C.m,std::vector<long double>(C.m+1,0));
+                std::vector<int> need(C.cons.size()), left(C.cons.size()), assignment(groups.size());
+                for(size_t ci=0;ci<C.cons.size();++ci) {
+                    need[ci]=C.cons[ci].num-C.cons[ci].knownMines;
+                    left[ci]=static_cast<int>(C.cons[ci].uidx.size());
+                }
+                // Give larger frontiers a bounded exact attempt before sampling.
+                size_t nodeBudget=C.m<=32 ? ENUM_NODE_BUDGET : 100000;
+                bool aborted=false;
+                std::function<void(size_t,int,long double)> dfs=[&](size_t depth,int mines,long double weight) {
+                    if(aborted) return;
+                    if(nodeBudget==0 || ((nodeBudget&1023)==0 && !searchBlock())) { aborted=true; return; }
+                    --nodeBudget;
+                    if(depth==groups.size()) {
+                        R.totalSolutions+=weight;
+                        R.waysK[mines]+=weight;
+                        for(size_t g=0;g<groups.size();++g) {
+                            const int size=static_cast<int>(groups[g].vars.size()), count=assignment[g];
+                            const long double mined=weight*count/size, safe=weight*(size-count)/size;
+                            for(int t : groups[g].vars) {
+                                R.mineWaysPerCellK[t][mines]+=mined;
+                                R.safeWaysPerCellK[t][mines]+=safe;
+                            }
+                        }
+                        return;
+                    }
+                    const auto& group=groups[depth];
+                    const int size=static_cast<int>(group.vars.size());
+                    int low=0,high=size;
+                    for(int ci : group.cons) {
+                        low=std::max(low,need[ci]-(left[ci]-size));
+                        high=std::min(high,need[ci]);
+                    }
+                    for(int count=low;count<=high && !aborted;++count) {
+                        assignment[depth]=count;
+                        for(int ci : group.cons) { need[ci]-=count; left[ci]-=size; }
+                        dfs(depth+1,mines+count,weight*group.choose[count]);
+                        for(int ci : group.cons) { need[ci]+=count; left[ci]+=size; }
+                    }
+                };
+                dfs(0,0,1);
 				if(!aborted && R.totalSolutions == 0.0L){ R.inconsistent = true; compResults[cid] = std::move(R); return; }
                 if(!aborted && R.totalSolutions > 0.0L){
 					R.enumerated = true;
@@ -420,16 +453,18 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
 					R.beliefs.assign(C.m, 0.5);
 					R.probCertainBits.assign(C.m, 0);
 					for(int t=0;t<C.m;++t){
-						long double mw=0.0L; for(int k=0;k<=C.m;++k) mw += R.mineWaysPerCellK[t][k];
+						long double mw=0.0L, sw=0.0L;
+                        for(int k=0;k<=C.m;++k) { mw+=R.mineWaysPerCellK[t][k]; sw+=R.safeWaysPerCellK[t][k]; }
 						if(mw <= 0.0L){ R.beliefs[t] = 0.0; R.probCertainBits[t]=1; }
-						else if(std::abs(mw - R.totalSolutions) <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
-						else { R.beliefs[t] = (double)(mw / R.totalSolutions); }
+						else if(sw <= 0.0L){ R.beliefs[t] = 1.0; R.probCertainBits[t]=1; }
+						else { R.beliefs[t] = (double)(mw / (mw+sw)); }
 					}
 				} else {
 					R.enumerated = false;
 					R.totalSolutions = 0.0L;
 					R.waysK.clear();
 					R.mineWaysPerCellK.clear();
+					R.safeWaysPerCellK.clear();
 					R.probCertainBits.clear();
 				}
 			}
@@ -643,11 +678,12 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         // expose enumerated results to comps for global combination step
         for(int cid=0; cid<compCount; ++cid){
             auto& C = comps[cid];
-            const auto& R = compResults[cid];
+            auto& R = compResults[cid];
             if(R.enumerated){
                 C.enumerated = true;
-                C.waysK = R.waysK;
-                C.mineWaysPerCellK = R.mineWaysPerCellK;
+                C.waysK = std::move(R.waysK);
+                C.mineWaysPerCellK = std::move(R.mineWaysPerCellK);
+                C.safeWaysPerCellK = std::move(R.safeWaysPerCellK);
                 C.totalSolutions = R.totalSolutions;
             }
         }
@@ -674,8 +710,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
         bool allEnumerated = true;
         for(const auto& C : comps) { allEnumerated &= C.enumerated; enumeratedVars += C.m; }
         // Only a completely enumerated frontier supports exact conditioning.
-        // Bound the convolution cost; larger boards retain local probabilities.
-        if(totalMines>=0 && allEnumerated && enumeratedVars<=512) {
+        if(totalMines>=0 && allEnumerated) {
             const int remaining=totalMines-fixedBeforeSearch;
             const int freeCount=freeBeforeSearch;
             if(remaining<0 || remaining>enumeratedVars+freeCount) return invalid();
@@ -686,44 +721,77 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 if(a<b) std::swap(a,b);
                 return a+std::log1p(std::exp(b-a));
             };
-            auto convolve = [&](const std::vector<long double>& a, const std::vector<long double>& b) {
-                std::vector<long double> out(a.size()+b.size()-1, negInf);
-                for(size_t i=0;i<a.size();++i) if(a[i]!=negInf)
-                    for(size_t j=0;j<b.size();++j) if(b[j]!=negInf)
-                        out[i+j]=logAdd(out[i+j], a[i]+b[j]);
-                return out;
-            };
-            std::vector<std::vector<long double>> logs(compCount);
+            // Compact away impossible counts. A component with a fixed mine
+            // count occupies one slot, irrespective of its number of cells.
+            struct Distribution { int offset=0; std::vector<long double> values; };
+            std::vector<Distribution> logs(compCount), prefix(compCount+1);
             for(int c=0;c<compCount;++c) {
-                for(long double ways : comps[c].waysK) logs[c].push_back(ways>0 ? std::log(ways) : negInf);
+                const auto& ways=comps[c].waysK;
+                int first=0,last=comps[c].m;
+                while(first<=last && ways[first]==0) ++first;
+                while(last>=first && ways[last]==0) --last;
+                logs[c].offset=first;
+                for(int k=first;k<=last;++k) logs[c].values.push_back(ways[k]>0 ? std::log(ways[k]) : negInf);
             }
-            std::vector<std::vector<long double>> prefix(compCount+1), suffix(compCount+1);
-            prefix[0]={0}; suffix[compCount]={0};
-            for(int c=0;c<compCount;++c) prefix[c+1]=convolve(prefix[c], logs[c]);
-            for(int c=compCount-1;c>=0;--c) suffix[c]=convolve(logs[c], suffix[c+1]);
+            // Bound actual support width and work, rather than rejecting every
+            // frontier above an arbitrary number of cells.
+            size_t entries=1,work=0,width=1;
+            bool withinBudget=true;
+            for(const auto& distribution : logs) {
+                work+=width*distribution.values.size();
+                width+=distribution.values.size()-1;
+                entries+=width;
+                if(entries>1000000 || work>8000000) { withinBudget=false; break; }
+            }
+            if(withinBudget) {
+            prefix[0].values={0};
+            for(int c=0;c<compCount;++c) {
+                if(cancelled()) return invalid();
+                const auto& a=prefix[c]; const auto& b=logs[c];
+                auto& out=prefix[c+1]; out.offset=a.offset+b.offset;
+                out.values.assign(a.values.size()+b.values.size()-1,negInf);
+                for(size_t i=0;i<a.values.size();++i) {
+                    if((i&127)==0 && cancelled()) return invalid();
+                    if(a.values[i]!=negInf) for(size_t j=0;j<b.values.size();++j) if(b.values[j]!=negInf)
+                        out.values[i+j]=logAdd(out.values[i+j],a.values[i]+b.values[j]);
+                }
+            }
             std::vector<long double> freeLog(freeCount+1, 0);
             for(int k=1;k<=freeCount;++k)
                 freeLog[k]=freeLog[k-1]+std::log(static_cast<long double>(freeCount-k+1))-std::log(static_cast<long double>(k));
             auto outside = [&](int k) { return k>=0 && k<=freeCount ? freeLog[k] : negInf; };
             long double total=negInf;
-            for(int k=0;k<(int)prefix.back().size();++k) {
-                long double weight=outside(remaining-k);
-                if(weight!=negInf && prefix.back()[k]!=negInf) total=logAdd(total,prefix.back()[k]+weight);
+            std::vector<long double> tail(prefix.back().values.size(),negInf);
+            for(size_t k=0;k<tail.size();++k) {
+                tail[k]=outside(remaining-prefix.back().offset-static_cast<int>(k));
+                if(tail[k]!=negInf && prefix.back().values[k]!=negInf)
+                    total=logAdd(total,prefix.back().values[k]+tail[k]);
             }
             if(total==negInf) return invalid();
-            for(int c=0;c<compCount;++c) {
+            // Backward messages reuse the prefix convolution. Re-convolving all
+            // other components for every cell group grows quadratically in the
+            // number of components and is unnecessary.
+            for(int c=compCount-1;c>=0;--c) {
                 if(cancelled()) return invalid();
                 const auto& C=comps[c];
-                const auto other=convolve(prefix[c], suffix[c+1]);
                 std::vector<long double> weights(C.m+1,negInf);
-                for(int k=0;k<=C.m;++k) for(int j=0;j<(int)other.size();++j) {
-                    long double out=outside(remaining-k-j);
-                    if(out!=negInf && other[j]!=negInf) weights[k]=logAdd(weights[k],other[j]+out);
+                std::vector<long double> previous(prefix[c].values.size(),negInf);
+                for(size_t p=0;p<previous.size();++p) {
+                    if((p&127)==0 && cancelled()) return invalid();
+                    for(size_t k=0;k<logs[c].values.size();++k) {
+                        if(tail[p+k]==negInf || logs[c].values[k]==negInf) continue;
+                        previous[p]=logAdd(previous[p],logs[c].values[k]+tail[p+k]);
+                        if(prefix[c].values[p]!=negInf) {
+                            const int count=logs[c].offset+static_cast<int>(k);
+                            weights[count]=logAdd(weights[count],prefix[c].values[p]+tail[p+k]);
+                        }
+                    }
                 }
+                tail=std::move(previous);
                 for(int t=0;t<C.m;++t) {
                     long double mine=negInf, safe=negInf;
                     for(int k=0;k<=C.m;++k) if(weights[k]!=negInf) {
-                        long double m=C.mineWaysPerCellK[t][k], f=C.waysK[k]-m;
+                        long double m=C.mineWaysPerCellK[t][k], f=C.safeWaysPerCellK[t][k];
                         if(m>0) mine=logAdd(mine,std::log(m)+weights[k]);
                         if(f>0) safe=logAdd(safe,std::log(f)+weights[k]);
                     }
@@ -735,10 +803,10 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
             }
             if(freeCount>0) {
                 long double mine=negInf, safe=negInf;
-                for(int k=0;k<(int)prefix.back().size();++k) {
-                    const int out=remaining-k;
-                    if(out<0 || out>freeCount || prefix.back()[k]==negInf) continue;
-                    const long double weight=prefix.back()[k]+freeLog[out];
+                for(size_t k=0;k<prefix.back().values.size();++k) {
+                    const int out=remaining-prefix.back().offset-static_cast<int>(k);
+                    if(out<0 || out>freeCount || prefix.back().values[k]==negInf) continue;
+                    const long double weight=prefix.back().values[k]+freeLog[out];
                     if(out>0) mine=logAdd(mine,weight+std::log(static_cast<long double>(out)/freeCount));
                     if(out<freeCount) safe=logAdd(safe,weight+std::log(static_cast<long double>(freeCount-out)/freeCount));
                 }
@@ -746,6 +814,7 @@ Overlay compute_overlay(const Board& board, int totalMines, bool enableChords, i
                 for(int i=0;i<N;++i) if(cells[i]==CellState::Unknown && !isFrontier[i] && ov.marks[i]==Mark::None) {
                     ov.mineProbability[i]=p; probCertain[i]=(mine==negInf || safe==negInf);
                 }
+            }
             }
         }
 

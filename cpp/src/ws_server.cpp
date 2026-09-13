@@ -93,7 +93,8 @@ void WebSocketServer::set_on_connection(ConnectionCallback cb) {
 void WebSocketServer::notify_connection(bool connected) {
     ConnectionCallback cb;
     { std::lock_guard<std::mutex> lock(callback_mutex_); cb=on_connection_; }
-    if(cb) cb(connected);
+    try { if(cb) cb(connected); }
+    catch(...) { std::cerr<<"WebSocket connection callback failed\n"; }
 }
 
 bool WebSocketServer::start(uint16_t port) {
@@ -122,7 +123,8 @@ bool WebSocketServer::start(uint16_t port) {
 void WebSocketServer::stop() {
     running_=false;
 #ifdef _WIN32
-    // Wake blocking reads, but let each owner close its socket after it stops
+    client_stopping_=true;
+    // Interrupt I/O, but let each owner close its socket after it stops
     // using it. Closing and reusing a SOCKET during recv races a new connection.
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
@@ -141,10 +143,33 @@ void WebSocketServer::stop() {
 namespace {
 using Clock=std::chrono::steady_clock;
 
-bool send_all(SOCKET s, const std::string& data) {
+bool wait_socket(SOCKET s,bool writing,Clock::time_point deadline,const std::atomic<bool>& running,
+                 const std::atomic<bool>* interrupted=nullptr) {
+    while(running && (!interrupted || !*interrupted)) {
+        const auto now=Clock::now();
+        if(now>=deadline) return false;
+        const auto remaining=deadline==Clock::time_point::max() ? std::chrono::microseconds(100000) :
+            std::min(std::chrono::duration_cast<std::chrono::microseconds>(deadline-now),std::chrono::microseconds(100000));
+        timeval timeout{0,static_cast<long>(remaining.count())};
+        fd_set ready; FD_ZERO(&ready); FD_SET(s,&ready);
+        const int result=select(0,writing ? nullptr : &ready,writing ? &ready : nullptr,nullptr,&timeout);
+        if(result>0) return running && (!interrupted || !*interrupted);
+        if(result==SOCKET_ERROR) return false;
+    }
+    return false;
+}
+
+bool send_all(SOCKET s,const std::string& data,const std::atomic<bool>& running,
+              const std::atomic<bool>* interrupted=nullptr) {
     size_t sent=0;
+    const auto deadline=Clock::now()+std::chrono::seconds(5);
     while(sent<data.size()) {
+        if(!running || (interrupted && *interrupted) || Clock::now()>=deadline) return false;
         const int n=send(s,data.data()+sent,static_cast<int>(data.size()-sent),0);
+        if(n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK) {
+            if(!wait_socket(s,true,deadline,running,interrupted)) return false;
+            continue;
+        }
         if(n<=0) return false;
         sent+=n;
     }
@@ -213,7 +238,7 @@ bool WebSocketServer::perform_handshake(SOCKET s,const std::string& request) {
     if(headers["host"]!="127.0.0.1"+port && headers["host"]!="localhost"+port) return false;
     const std::string response="HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+
         sha1_base64(headers["sec-websocket-key"]+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")+"\r\n\r\n";
-    return send_all(s,response);
+    return send_all(s,response,running_);
 }
 
 void WebSocketServer::accept_loop() {
@@ -229,17 +254,23 @@ void WebSocketServer::accept_loop() {
             if(!running_) { closesocket(s); break; }
             handshake_socket_=s;
         }
-        DWORD ioTimeout=1000;
-        setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&ioTimeout),sizeof(ioTimeout));
-        setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,reinterpret_cast<const char*>(&ioTimeout),sizeof(ioTimeout));
+        u_long nonblocking=1;
+        if(ioctlsocket(s,FIONBIO,&nonblocking)!=0) {
+            std::lock_guard<std::mutex> lock(client_mutex_);
+            handshake_socket_=INVALID_SOCKET;
+            closesocket(s);
+            continue;
+        }
         const BOOL noDelay=TRUE;
         setsockopt(s,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&noDelay),sizeof(noDelay));
         std::string request;
         size_t headerEnd=std::string::npos;
         const auto deadline=Clock::now()+std::chrono::seconds(3);
         while(running_ && request.size()<16384 && Clock::now()<deadline) {
+            if(!wait_socket(s,false,deadline,running_)) break;
             char buffer[2048];
             int n=recv(s,buffer,static_cast<int>(std::min<size_t>(sizeof(buffer),16384-request.size())),0);
+            if(n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK) continue;
             if(n<=0) break;
             request.append(buffer,n);
             headerEnd=request.find("\r\n\r\n");
@@ -247,6 +278,7 @@ void WebSocketServer::accept_loop() {
         }
         bool accepted=running_ && headerEnd!=std::string::npos && perform_handshake(s,request.substr(0,headerEnd+4));
         if(accepted) {
+            client_stopping_=true;
             {
                 std::lock_guard<std::mutex> lock(client_mutex_);
                 if(client_socket_!=INVALID_SOCKET) shutdown(client_socket_,SD_BOTH);
@@ -258,6 +290,7 @@ void WebSocketServer::accept_loop() {
             handshake_socket_=INVALID_SOCKET;
             if(!accepted || !running_) { closesocket(s); continue; }
             client_socket_=s;
+            client_stopping_=false;
         }
         notify_connection(true);
         client_thread_=std::thread(&WebSocketServer::client_loop,this,s,request.substr(headerEnd+4));
@@ -266,6 +299,10 @@ void WebSocketServer::accept_loop() {
 
 bool WebSocketServer::send_frame(SOCKET s,uint8_t opcode,const std::string& data) {
     std::lock_guard<std::mutex> lock(send_mutex_);
+    return send_frame_locked(s,opcode,data);
+}
+
+bool WebSocketServer::send_frame_locked(SOCKET s,uint8_t opcode,const std::string& data) {
     std::string frame;
     const uint64_t length=data.size();
     frame.reserve(data.size()+10);
@@ -278,26 +315,41 @@ bool WebSocketServer::send_frame(SOCKET s,uint8_t opcode,const std::string& data
         for(int i=7;i>=0;--i) frame.push_back(static_cast<char>(length>>(i*8)));
     }
     frame+=data;
-    return send_all(s,frame);
+    if(send_all(s,frame,running_,&client_stopping_)) return true;
+    // A partial frame cannot be followed by another frame on this stream.
+    client_stopping_=true;
+    shutdown(s,SD_BOTH);
+    return false;
 }
 
-bool WebSocketServer::read_message(SOCKET s,std::string& buffered,std::string& text) {
+bool WebSocketServer::read_message(SOCKET s,ReceiveBuffer& buffered,std::string& text) {
     text.clear();
     bool fragmented=false;
     auto deadline=Clock::time_point::max();
     auto read_exact = [&](char* dst,size_t size) {
         size_t got=0;
-        while(got<size && running_) {
+        while(got<size && running_ && !client_stopping_) {
             if(Clock::now()>=deadline) return false;
-            size_t available=std::min(size-got,buffered.size());
+            size_t available=std::min(size-got,buffered.bytes.size()-buffered.consumed);
             if(available>0) {
-                std::memcpy(dst+got,buffered.data(),available);
-                buffered.erase(0,available); got+=available;
+                std::memcpy(dst+got,buffered.bytes.data()+buffered.consumed,available);
+                buffered.consumed+=available; got+=available;
             } else {
-                int n=recv(s,dst+got,static_cast<int>(size-got),0);
-                if(n==SOCKET_ERROR && WSAGetLastError()==WSAETIMEDOUT) continue;
+                std::array<char,8192> chunk;
+                const bool direct=size-got>=chunk.size();
+                char* destination=direct ? dst+got : chunk.data();
+                const size_t capacity=direct ? size-got : chunk.size();
+                int n=recv(s,destination,static_cast<int>(capacity),0);
+                if(n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK) {
+                    if(!wait_socket(s,false,deadline,running_,&client_stopping_)) return false;
+                    continue;
+                }
                 if(n<=0) return false;
-                got+=n;
+                if(direct) got+=n;
+                else {
+                    buffered.bytes.assign(chunk.data(),static_cast<size_t>(n));
+                    buffered.consumed=0;
+                }
             }
             if(deadline==Clock::time_point::max()) deadline=Clock::now()+std::chrono::seconds(5);
         }
@@ -349,18 +401,22 @@ bool WebSocketServer::read_message(SOCKET s,std::string& buffered,std::string& t
 }
 
 void WebSocketServer::client_loop(SOCKET s,std::string buffered) {
+    ReceiveBuffer input{std::move(buffered),0};
     try {
-        while(running_) {
+        while(running_ && !client_stopping_) {
             std::string text;
-            if(!read_message(s,buffered,text)) break;
+            if(!read_message(s,input,text)) break;
             MessageCallback cb;
             { std::lock_guard<std::mutex> lock(callback_mutex_); cb=on_message_; }
-            if(cb && running_) cb(WsMessage{std::move(text)});
+            if(cb && running_ && !client_stopping_) cb(WsMessage{std::move(text)});
         }
     } catch(const std::exception& e) {
         std::cerr<<"WebSocket client: "<<e.what()<<'\n';
+    } catch(...) {
+        std::cerr<<"WebSocket client callback failed\n";
     }
     {
+        std::lock_guard<std::mutex> sendLock(send_mutex_);
         std::lock_guard<std::mutex> lock(client_mutex_);
         closesocket(s);
         if(client_socket_==s) client_socket_=INVALID_SOCKET;
@@ -374,8 +430,13 @@ void WebSocketServer::accept_loop() {}
 bool WebSocketServer::send_text(const std::string& data) {
 #ifdef _WIN32
     if(data.size()>proto::MaxMessageBytes || !valid_utf8(data)) return false;
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    return client_socket_!=INVALID_SOCKET && send_frame(client_socket_,1,data);
+    std::lock_guard<std::mutex> sendLock(send_mutex_);
+    SOCKET s;
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        s=client_socket_;
+    }
+    return running_ && !client_stopping_ && s!=INVALID_SOCKET && send_frame_locked(s,1,data);
 #else
     (void)data; return false;
 #endif

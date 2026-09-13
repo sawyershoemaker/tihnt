@@ -11,6 +11,7 @@ inline constexpr size_t MaxMessageBytes = 1024 * 1024;
 struct GeometryMsg {
     bool has_mines_total = false;
     bool has_geometry = false;
+    bool has_clip = false;
     int cell_px=0;
     int origin_x=0;
     int origin_y=0;
@@ -19,6 +20,10 @@ struct GeometryMsg {
     double rect_t=0.0;
     double rect_w=0.0;
     double rect_h=0.0;
+    double clip_l=0.0;
+    double clip_t=0.0;
+    double clip_w=0.0;
+    double clip_h=0.0;
     double vv_x=0.0;
     double vv_y=0.0;
     double vv_scale=1.0;

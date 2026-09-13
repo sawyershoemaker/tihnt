@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -11,17 +12,39 @@
 #include "proto.hpp"
 #include "solver.hpp"
 #include "overlay.hpp"
+#include "session.hpp"
 
 namespace {
-struct SolverJob {
-    game::Board board;
-    int minesTotal=-1;
-    bool enableChords=true;
-    uint64_t revision=0;
+enum HotkeyId { Exit=1, Chords=2, Capture=3, Safety=4 };
+constexpr struct { int id; UINT modifiers, key; const char* name; } hotkeyCommands[] = {
+    {Exit,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'X',"Ctrl + Alt + X"},
+    {Chords,MOD_CONTROL|MOD_NOREPEAT,'P',"Ctrl + P"},
+    {Capture,MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_NOREPEAT,'W',"Ctrl + Alt + Shift + W"},
+    {Safety,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'S',"Ctrl + Alt + S"}
 };
-struct SolverResult {
-    std::vector<solve::Mark> marks;
-    uint64_t revision=0;
+
+struct Hotkeys {
+    int registered=0;
+    ~Hotkeys() { release(); }
+    void release() {
+        while(registered>0) UnregisterHotKey(nullptr,hotkeyCommands[--registered].id);
+    }
+    bool create() {
+        for(const auto& command : hotkeyCommands) {
+            if(!RegisterHotKey(nullptr,command.id,command.modifiers,command.key)) {
+                const DWORD error=GetLastError();
+                release();
+                const std::string name=command.name;
+                std::cerr<<"Failed to register "<<name<<", Win32 error "<<error<<'\n';
+                const std::wstring message=L"Could not register "+std::wstring(name.begin(),name.end())+
+                    L".\nTIHNT cannot start without its keyboard controls.";
+                MessageBoxW(nullptr,message.c_str(),L"TIHNT",MB_OK|MB_ICONERROR);
+                return false;
+            }
+            ++registered;
+        }
+        return true;
+    }
 };
 
 OverlayGeometry geometry_for(const proto::GeometryMsg& message, int w, int h) {
@@ -29,6 +52,9 @@ OverlayGeometry geometry_for(const proto::GeometryMsg& message, int w, int h) {
     g.board_w=w; g.board_h=h;
     g.rect_l=message.rect_l; g.rect_t=message.rect_t;
     g.rect_w=message.rect_w; g.rect_h=message.rect_h;
+    g.has_clip=message.has_clip;
+    g.clip_l=message.clip_l; g.clip_t=message.clip_t;
+    g.clip_w=message.clip_w; g.clip_h=message.clip_h;
     g.vv_x=message.vv_x; g.vv_y=message.vv_y;
     g.vv_scale=message.vv_scale; g.dpr=message.dpr;
     return g;
@@ -41,28 +67,27 @@ int main() {
     auto setContext=user32 ? reinterpret_cast<SetDpiContext>(GetProcAddress(user32,"SetProcessDpiAwarenessContext")) : nullptr;
     if(!setContext || !setContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) SetProcessDPIAware();
 
+    Hotkeys hotkeys;
+    if(!hotkeys.create()) return 1;
     OverlayWindow overlay;
     if(!overlay.create()) return 1;
     HANDLE wake=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!wake) return 1;
 
     std::mutex stateMutex;
-    game::Board board;
-    OverlayGeometry geometry{};
-    int minesTotal=-1;
-    std::atomic<uint64_t> revision{0};
-    std::atomic<bool> dirty{false}, geometryDirty{false}, bindingDirty{false}, stopping{false};
-    uint32_t targetPid=0;
-    bool enableChords=true;
+    app::Session session;
+    std::atomic<bool> stopping{false};
+    auto updatePresentation=[&] {
+        if(!session.take_presentation_changed()) return;
+        const auto& view=session.presentation();
+        overlay.update(view.marks,geometry_for(view.geometry,view.width,view.height),view.minesTotal);
+    };
 
     net::WebSocketServer server;
     server.set_on_connection([&](bool) {
         {
             std::lock_guard<std::mutex> lock(stateMutex);
-            board.resize(0,0); geometry={}; minesTotal=-1; targetPid=0;
-            ++revision;
-            dirty=true;
-            bindingDirty=true;
+            session.reset();
         }
         SetEvent(wake);
     });
@@ -71,31 +96,7 @@ int main() {
         if(!proto::parse_message(msg.text,parsed)) return;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
-            bool changed=false;
-            if(parsed.type==proto::MsgType::Full) {
-                const auto& f=parsed.full;
-                changed=board.width()!=f.w || board.height()!=f.h || board.data()!=f.cells || minesTotal!=f.mines_total;
-                if(changed) board.apply_full(std::move(parsed.full.cells),f.w,f.h);
-                minesTotal=f.mines_total;
-                geometry=geometry_for(f,f.w,f.h);
-                geometryDirty=true;
-            } else if(parsed.type==proto::MsgType::Delta) {
-                if(board.width()==0) return; // A delta never establishes a board.
-                const auto& d=parsed.delta;
-                for(const auto& u:d.updates) if(u.x>=board.width() || u.y>=board.height()) return;
-                for(const auto& u:d.updates) {
-                    if(board.at(u.x,u.y)!=u.state) { board.set(u.x,u.y,u.state); changed=true; }
-                }
-                if(d.has_mines_total && minesTotal!=d.mines_total) { minesTotal=d.mines_total; changed=true; }
-                if(d.has_geometry) {
-                    geometry=geometry_for(d,board.width(),board.height());
-                    geometryDirty=true;
-                }
-            } else if(parsed.type==proto::MsgType::Bind) {
-                targetPid=static_cast<uint32_t>(parsed.bind.pid);
-                bindingDirty=true;
-            }
-            if(changed) { ++revision; dirty=true; }
+            if(!session.apply(std::move(parsed))) return;
         }
         SetEvent(wake);
     });
@@ -104,27 +105,22 @@ int main() {
         CloseHandle(wake); return 1;
     }
 
-    constexpr int Exit=1, Chords=2, Capture=3, Safety=4;
-    RegisterHotKey(nullptr,Exit,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'X');
-    RegisterHotKey(nullptr,Chords,MOD_CONTROL|MOD_NOREPEAT,'P');
-    RegisterHotKey(nullptr,Capture,MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_NOREPEAT,'W');
-    RegisterHotKey(nullptr,Safety,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'S');
-
     std::mutex jobMutex,resultMutex;
     std::condition_variable jobCv;
-    SolverJob pendingJob;
-    SolverResult latestResult;
+    app::SolverJob pendingJob;
+    app::SolverResult latestResult;
     bool jobReady=false,resultReady=false;
     std::thread solver([&] {
         for(;;) {
-            SolverJob job;
+            app::SolverJob job;
             {
                 std::unique_lock<std::mutex> lock(jobMutex);
                 jobCv.wait(lock,[&] { return stopping || jobReady; });
                 if(stopping) break;
                 job=std::move(pendingJob); jobReady=false;
             }
-            auto cancelled=[&] { return stopping.load() || revision.load()!=job.revision; };
+            auto cancelled=[&] { return stopping.load() || session.current_revision()!=job.revision; };
+            if(cancelled()) continue;
             solve::Overlay result;
             try { result=solve::compute_overlay(job.board,job.minesTotal,job.enableChords,0,cancelled); }
             catch(const std::exception& e) {
@@ -141,17 +137,16 @@ int main() {
         }
     });
 
-    std::vector<solve::Mark> lastMarks;
     bool running=true;
     while(running) {
         MSG msg;
-        while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {
+        for(int dispatched=0;dispatched<64 && PeekMessageW(&msg,nullptr,0,0,PM_REMOVE);++dispatched) {
             if(msg.message==WM_QUIT) { running=false; break; }
             if(msg.message==WM_HOTKEY) {
                 if(msg.wParam==Exit) { running=false; break; }
                 if(msg.wParam==Chords) {
                     std::lock_guard<std::mutex> lock(stateMutex);
-                    enableChords=!enableChords; ++revision; dirty=true;
+                    session.set_chords(!session.chords_enabled());
                 }
                 if(msg.wParam==Capture) overlay.set_excluded_from_capture(!overlay.is_excluded_from_capture());
                 if(msg.wParam==Safety) overlay.set_safety_mode(!overlay.is_safety_mode());
@@ -162,37 +157,32 @@ int main() {
         if(!running) break;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
-            if(bindingDirty.exchange(false)) overlay.set_target_pid(targetPid);
-            if(dirty.exchange(false)) {
-                SolverJob job{board,minesTotal,enableChords,revision.load()};
+            if(auto binding=session.take_binding()) overlay.set_target_pid(*binding);
+            if(auto job=session.take_job()) {
                 {
                     std::lock_guard<std::mutex> jobLock(jobMutex);
-                    pendingJob=std::move(job); jobReady=true;
+                    pendingJob=std::move(*job); jobReady=true;
                 }
                 jobCv.notify_one();
-                // Previous marks may refer to another game, even at the same size.
-                lastMarks.assign(board.data().size(),solve::Mark::None);
-                geometryDirty=true;
             }
-            if(geometryDirty.exchange(false)) overlay.update(lastMarks,geometry,minesTotal);
+            updatePresentation();
         }
         {
             std::lock_guard<std::mutex> lock(resultMutex);
             if(resultReady) {
                 std::lock_guard<std::mutex> stateLock(stateMutex);
-                if(latestResult.revision==revision.load()) {
-                    lastMarks=std::move(latestResult.marks);
-                    // Use current geometry: scrolling does not invalidate a solve.
-                    overlay.update(lastMarks,geometry,minesTotal);
-                }
+                session.accept(std::move(latestResult));
+                updatePresentation();
                 resultReady=false;
             }
         }
         overlay.tick();
-        MsgWaitForMultipleObjects(1,&wake,FALSE,50,QS_ALLINPUT);
+        MsgWaitForMultipleObjectsEx(1,&wake,50,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
     }
-    for(int id : {Exit,Chords,Capture,Safety}) UnregisterHotKey(nullptr,id);
-    stopping=true;
+    {
+        std::lock_guard<std::mutex> lock(jobMutex);
+        stopping=true;
+    }
     jobCv.notify_all();
     solver.join();
     server.stop();
@@ -201,4 +191,4 @@ int main() {
     return 0;
 }
 
-int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) { return main(); }
+_Use_decl_annotations_ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) { return main(); }
